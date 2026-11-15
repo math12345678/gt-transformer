@@ -1559,7 +1559,7 @@
         ].join("\t")
       );
     });
-    downloadBlob(`${ds}_openrdp_summary.tsv`, lines.join("\n"), "text/tab-separated-values");
+    downloadBlob(`${ds}_summary.tsv`, lines.join("\n"), "text/tab-separated-values");
   }
 
   function exportBreakpointsCsv() {

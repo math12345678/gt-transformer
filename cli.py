@@ -50,7 +50,7 @@ def _open_browser_when_ready(url: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Start the OpenRDP / GT-Transformer Web Interface.")
+    parser = argparse.ArgumentParser(description="Start the GT-Transformer Web Interface.")
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"), help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8765")), help="Bind port (default: 8765)")
     parser.add_argument("--no-browser", action="store_true", help="Do not automatically open a browser tab")

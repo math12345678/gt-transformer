@@ -353,9 +353,9 @@ PRESET_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "test_neisseria": {
         "id": "test_neisseria",
-        "label": "test_neisseria — OpenRDP Empirical Benchmark (S=4, L=787 bp)",
-        "category": "Empirical Bacterial Alignment (OpenRDP Test)",
-        "description": "4 Neisseria sequences (787 bp, 62 informative sites) from OpenRDP test suite.",
+        "label": "test_neisseria — Empirical Bacterial Benchmark (S=4, L=787 bp)",
+        "category": "Empirical Bacterial Alignment",
+        "description": "4 Neisseria sequences (787 bp, 62 informative sites).",
         "fasta_path": resolve_preset_fasta_path("test_neisseria.fasta", WORKSPACE_ROOT / "tools" / "openrdp" / "tests" / "test_neisseria.fasta"),
         "cache_dir": None,
         "is_control": False,
