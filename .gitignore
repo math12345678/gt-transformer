@@ -8,6 +8,7 @@ venv/
 
 # Teamwork agent metadata & archives
 .agents/
+.claude/
 
 # Concurrency locks & temporary files
 *.lock

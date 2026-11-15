@@ -13,14 +13,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copy application
+# Copy application and bundled checkpoints (ckpt_N10000 and ckpt_N10000_extreme)
 COPY . .
 
-# Hugging Face Spaces / container defaults
 ENV HOST=0.0.0.0
-ENV PORT=7860
+ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
-EXPOSE 7860
+EXPOSE 8080
 
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8080}/healthz || exit 1
+
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --timeout-keep-alive 120"]

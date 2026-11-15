@@ -12,6 +12,10 @@ from typing import Any
 
 
 GAP_CHARACTERS = set("-.~?")
+VALID = set("ACGTUNRYKMSWBDHV-.?")  # IUPAC + gaps; 08e must pass
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB cap
+MAX_SEQUENCES = 500
+MAX_COLUMNS = 50_000
 
 
 class AlignmentValidationError(ValueError):
@@ -71,6 +75,129 @@ class AllGapSequenceError(AlignmentValidationError):
         )
 
 
+def validate_alignment(records: list[tuple[str, str]]) -> None:
+    """Validate parsed (name, seq) alignment records according to Phase 2 rules.
+
+    Raises ValueError with a clear human-readable message on any validation failure.
+    """
+    if len(records) < 5:
+        raise ValueError(f"Need at least 5 sequences; this file has {len(records)}.")
+    if len(records) > MAX_SEQUENCES:
+        raise ValueError(
+            f"Alignment has {len(records)} sequences; maximum allowed is {MAX_SEQUENCES} sequences."
+        )
+    seen: dict[str, int] = {}
+    for i, (name, seq) in enumerate(records, 1):
+        if name in seen:
+            raise ValueError(f"Duplicate sequence name '{name}' (records {seen[name]} and {i}).")
+        seen[name] = i
+        bad = [(pos, ch) for pos, ch in enumerate(seq, 1) if ch not in VALID]
+        if bad:
+            pos, ch = bad[0]
+            raise ValueError(f"Sequence '{name}' has invalid character '{ch}' at column {pos}.")
+    ref = len(records[0][1])
+    if ref == 0:
+        raise ValueError(f"Sequence '{records[0][0]}' is empty (0 bp).")
+    if ref > MAX_COLUMNS:
+        raise ValueError(
+            f"Alignment length is {ref:,} bp; maximum allowed is {MAX_COLUMNS:,} columns."
+        )
+    for name, seq in records[1:]:
+        if len(seq) != ref:
+            raise ValueError(
+                f"Sequence '{name}' is {len(seq)} bp; '{records[0][0]}' is {ref} bp. "
+                "All sequences must be aligned to the same length."
+            )
+    for name, seq in records:
+        if len(seq) == 0:
+            raise ValueError(f"Sequence '{name}' is empty (0 bp).")
+        if set(seq).issubset(GAP_CHARACTERS):
+            raise ValueError(f"Sequence '{name}' contains only gap characters")
+
+
+def parse_raw_fasta_records(
+    fasta_text: str | bytes,
+) -> tuple[list[tuple[str, str]], dict[str, str], bool]:
+    """Parse raw FASTA text/bytes into cleaned (display_name, seq_with_U) records and full_headers map.
+
+    - Enforces 20 MB upload cap.
+    - Strips \\r, whitespace, and digits inside sequence lines; uppercases everything.
+    - Uses first word of each header as display name; stores full header in full_headers dict.
+    """
+    if fasta_text is None:
+        raise EmptyPayloadError("Empty alignment payload")
+
+    if isinstance(fasta_text, bytes):
+        if len(fasta_text) > MAX_UPLOAD_BYTES:
+            raise AlignmentValidationError(
+                f"Upload size ({len(fasta_text) / (1024 * 1024):.1f} MB) exceeds the 20 MB limit.",
+                status_code=400,
+            )
+        if len(fasta_text.strip()) == 0:
+            raise EmptyPayloadError("Empty alignment payload")
+        if b"\x00" in fasta_text:
+            raise BinaryPayloadError("Binary or non-text alignment content detected")
+        try:
+            text = fasta_text.decode("utf-8")
+        except UnicodeDecodeError:
+            raise BinaryPayloadError("Binary or non-text alignment content detected")
+    else:
+        raw_bytes_len = len(fasta_text.encode("utf-8", errors="ignore"))
+        if raw_bytes_len > MAX_UPLOAD_BYTES:
+            raise AlignmentValidationError(
+                f"Upload size ({raw_bytes_len / (1024 * 1024):.1f} MB) exceeds the 20 MB limit.",
+                status_code=400,
+            )
+        if len(fasta_text.strip()) == 0:
+            raise EmptyPayloadError("Empty alignment payload")
+        if "\x00" in fasta_text:
+            raise BinaryPayloadError("Binary or non-text alignment content detected")
+        text = fasta_text
+
+    if any(ord(c) < 32 and c not in "\r\n\t" for c in text):
+        raise BinaryPayloadError("Binary or non-text alignment content detected")
+
+    names: list[str] = []
+    full_headers: dict[str, str] = {}
+    seqs_parts: list[list[str]] = []
+    cur: list[str] | None = None
+    saw_u = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith(">"):
+            full_hdr = line[1:].strip() or f"seq_{len(names) + 1}"
+            display_name = full_hdr.split()[0]
+            names.append(display_name)
+            if display_name not in full_headers:
+                full_headers[display_name] = full_hdr
+            seqs_parts.append([])
+            cur = seqs_parts[-1]
+        else:
+            if cur is None:
+                raise AlignmentValidationError(
+                    "Invalid FASTA format: sequence data encountered before first '>' header.",
+                    status_code=400,
+                )
+            # Strip \r, whitespace, and digits inside sequence lines; uppercase everything
+            cleaned = re.sub(r"[\s0-9]+", "", line).upper()
+            if "U" in cleaned:
+                saw_u = True
+            cur.append(cleaned)
+
+    if not names:
+        raise AlignmentValidationError(
+            "No FASTA records ('>' headers) found in alignment.",
+            status_code=400,
+        )
+
+    seqs = ["".join(parts) for parts in seqs_parts]
+    records = list(zip(names, seqs))
+    return records, full_headers, saw_u
+
+
 def count_parsimony_informative_sites(
     seqs: list[str],
     max_gap_frac: float = 0.25,
@@ -117,93 +244,74 @@ def parse_and_validate_fasta(
     max_gap_frac: float = 0.25,
     min_sequences: int = 4,
     min_informative: int = 10,
+    strict_phase2: bool = False,
 ) -> tuple[list[str], list[str], bool, dict[str, Any]]:
     """Parse and rigorously validate FASTA alignment payload.
 
     Returns:
         (headers, seqs, is_rna, gap_status)
-    Raises:
-        EmptyPayloadError: Payload is empty or whitespace (HTTP 400).
-        BinaryPayloadError: Null bytes or non-text binary data detected (HTTP 400).
-        AlignmentValidationError: Invalid FASTA structure (HTTP 400/422).
-        UnequalLengthError: Sequences have unequal lengths (HTTP 422).
-        InsufficientSequencesError: Panel size S < min_sequences (HTTP 422).
-        InsufficientInformativeSitesError: Informative sites < min_informative (HTTP 422).
-        AllGapSequenceError: Any sequence contains only gap characters (HTTP 422).
     """
-    if fasta_text is None:
-        raise EmptyPayloadError("Empty alignment payload")
+    records_raw, full_headers, saw_u = parse_raw_fasta_records(fasta_text)
 
-    if isinstance(fasta_text, bytes):
-        if len(fasta_text.strip()) == 0:
-            raise EmptyPayloadError("Empty alignment payload")
-        if b"\x00" in fasta_text:
-            raise BinaryPayloadError("Binary or non-text alignment content detected")
+    if strict_phase2:
         try:
-            text = fasta_text.decode("utf-8")
-        except UnicodeDecodeError:
-            raise BinaryPayloadError("Binary or non-text alignment content detected")
-    else:
-        if len(fasta_text.strip()) == 0:
-            raise EmptyPayloadError("Empty alignment payload")
-        if "\x00" in fasta_text:
-            raise BinaryPayloadError("Binary or non-text alignment content detected")
-        text = fasta_text
+            validate_alignment(records_raw)
+        except ValueError as exc:
+            raise AlignmentValidationError(str(exc), status_code=400) from exc
 
-    # Non-printable control character check (excluding \r, \n, \t)
-    if any(ord(c) < 32 and c not in "\r\n\t" for c in text):
-        raise BinaryPayloadError("Binary or non-text alignment content detected")
+    names = [r[0] for r in records_raw]
+    seqs_raw = [r[1] for r in records_raw]
 
-    names: list[str] = []
-    seqs_parts: list[list[str]] = []
-    cur: list[str] | None = None
-    saw_u = False
+    if any(len(s) == 0 for s in seqs_raw):
+        raise AlignmentValidationError(
+            "One or more FASTA records contain an empty sequence.",
+            status_code=400 if strict_phase2 else 422,
+        )
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith(";"):
-            continue
-        if line.startswith(">"):
-            header = line[1:].strip() or f"seq_{len(names)}"
-            names.append(header)
-            seqs_parts.append([])
-            cur = seqs_parts[-1]
-        else:
-            if cur is None:
+    # Check duplicate names and invalid characters even in non-strict mode
+    seen: dict[str, int] = {}
+    for i, (name, seq) in enumerate(records_raw, 1):
+        if name in seen:
+            raise AlignmentValidationError(
+                f"Duplicate sequence name '{name}' (records {seen[name]} and {i}).",
+                status_code=400,
+            )
+        seen[name] = i
+        if not set(seq).issubset(GAP_CHARACTERS):
+            bad = [(pos, ch) for pos, ch in enumerate(seq, 1) if ch not in VALID]
+            if bad:
+                pos, ch = bad[0]
                 raise AlignmentValidationError(
-                    "Invalid FASTA format: sequence data encountered before first '>' header.",
+                    f"Sequence '{name}' has invalid character '{ch}' at column {pos}.",
                     status_code=400,
                 )
-            cleaned = re.sub(r"\s+", "", line).upper()
-            if "U" in cleaned:
-                saw_u = True
-                cleaned = cleaned.replace("U", "T")
-            cur.append(cleaned)
 
-    if not names:
+    if len(records_raw) > MAX_SEQUENCES:
         raise AlignmentValidationError(
-            "No FASTA records ('>' headers) found in alignment.",
+            f"Alignment has {len(records_raw)} sequences; maximum allowed is {MAX_SEQUENCES} sequences.",
             status_code=400,
         )
 
-    seqs = ["".join(parts) for parts in seqs_parts]
-    if any(len(s) == 0 for s in seqs):
-        raise AlignmentValidationError(
-            "One or more FASTA records contain an empty sequence.",
-            status_code=422,
-        )
+    # Normalize U -> T after character validation
+    seqs = [s.replace("U", "T") for s in seqs_raw]
 
     # 1. Unaligned headers / unequal sequence lengths
     lengths = {len(s) for s in seqs}
     if len(lengths) > 1:
         raise UnequalLengthError("Alignment sequences must have identical lengths")
 
+    if seqs and len(seqs[0]) > MAX_COLUMNS:
+        raise AlignmentValidationError(
+            f"Alignment length is {len(seqs[0]):,} bp; maximum allowed is {MAX_COLUMNS:,} columns.",
+            status_code=400,
+        )
+
     # 2. All-gap sequences
     for name, s in zip(names, seqs):
         if set(s).issubset(GAP_CHARACTERS):
             raise AllGapSequenceError(name)
 
-    # 3. Panel size < 4 sequences
+    # 3. Panel size < min_sequences
     S = len(seqs)
     if S < min_sequences:
         raise InsufficientSequencesError("Alignment requires at least 4 sequences for recombination detection")
@@ -221,6 +329,7 @@ def parse_and_validate_fasta(
         "mode": mode,
         "is_rna": saw_u,
         "max_gap_frac": max_gap_frac,
+        "full_headers": full_headers,
     }
     return names, seqs, saw_u, gap_status
 
@@ -230,42 +339,10 @@ def parse_fasta_text(fasta_text: str) -> tuple[list[str], list[str]]:
 
     Raises AlignmentValidationError / ValueError if the input is empty or not valid FASTA.
     """
-    if not fasta_text or not fasta_text.strip():
-        raise EmptyPayloadError("Empty alignment payload")
-    if "\x00" in fasta_text:
-        raise BinaryPayloadError("Binary or non-text alignment content detected")
-    if any(ord(c) < 32 and c not in "\r\n\t" for c in fasta_text):
-        raise BinaryPayloadError("Binary or non-text alignment content detected")
+    records_raw, _full_headers, _saw_u = parse_raw_fasta_records(fasta_text)
+    names = [r[0] for r in records_raw]
+    seqs = [r[1].replace("U", "T") for r in records_raw]
 
-    names: list[str] = []
-    seqs_parts: list[list[str]] = []
-    cur: list[str] | None = None
-
-    for raw_line in fasta_text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith(";"):
-            continue
-        if line.startswith(">"):
-            header = line[1:].strip() or f"seq_{len(names)}"
-            names.append(header)
-            seqs_parts.append([])
-            cur = seqs_parts[-1]
-        else:
-            if cur is None:
-                raise AlignmentValidationError(
-                    "Invalid FASTA format: sequence data encountered before first '>' header.",
-                    status_code=400,
-                )
-            cleaned = re.sub(r"\s+", "", line).upper().replace("U", "T")
-            cur.append(cleaned)
-
-    if not names:
-        raise AlignmentValidationError(
-            "No FASTA records ('>' headers) found in alignment.",
-            status_code=400,
-        )
-
-    seqs = ["".join(parts) for parts in seqs_parts]
     if any(len(s) == 0 for s in seqs):
         raise AlignmentValidationError(
             "One or more FASTA records contain an empty sequence.",

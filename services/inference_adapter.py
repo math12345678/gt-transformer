@@ -81,6 +81,7 @@ from services.fasta_utils import (  # noqa: E402
     parse_and_validate_fasta,
     parse_fasta_text,
     parse_ground_truth_payload,
+    parse_raw_fasta_records,
 )
 from services.timing import TimingHistoryStore, TimingRecorder  # noqa: E402
 
@@ -89,21 +90,21 @@ from services.timing import TimingHistoryStore, TimingRecorder  # noqa: E402
 # Checkpoint Metadata & Multi-Discovery
 # ---------------------------------------------------------------------------
 KNOWN_CHECKPOINT_METADATA: dict[str, dict[str, Any]] = {
-    "ckpt_N10000_extreme": {
-        "label": "ckpt_N10000_extreme — Latest Multi-Rate (7k In-Range + Extreme)",
+    "ckpt_N10000": {
+        "label": "ckpt_N10000 — 10k In-Range Standard Model (Recommended Default)",
         "description": (
-            "Latest checkpoint trained jointly on 7,000 in-range alignments and extreme "
-            "mutation/recombination arms (0.2x–5.0x rates). 0.0000 AUPRC on extreme clonal controls."
+            "Default checkpoint trained on 7,000 in-range SantaSim alignments (10,000 corpus; "
+            "val AUPRC 0.572, test AUPRC 0.366). Best calibrated for standard viral alignments."
         ),
         "recommended": True,
     },
-    "ckpt_N10000": {
-        "label": "ckpt_N10000 — 10k In-Range Scaling Model (val AUPRC 0.572)",
+    "ckpt_N10000_extreme": {
+        "label": "ckpt_N10000_extreme — Multi-Rate Extreme Regime (0.2x–5.0x Rates)",
         "description": (
-            "Trained on 7,000 in-range SantaSim alignments (10,000 corpus; 1,500 held-out test, "
-            "test AUPRC 0.366, best F1 0.435)."
+            "Trained jointly on 7,000 in-range alignments and extreme mutation/recombination "
+            "arms (0.2x–5.0x rates). Use for hyper-divergent or ultra-conserved alignments."
         ),
-        "recommended": False,
+        "recommended": True,
     },
     "ckpt_N8000": {
         "label": "ckpt_N8000 — 8k Scaling Checkpoint (val AUPRC 0.539)",
@@ -146,7 +147,7 @@ def discover_available_checkpoints() -> dict[str, dict[str, Any]]:
                 meta = KNOWN_CHECKPOINT_METADATA.get(cid, {
                     "label": f"{cid} (Bundled Local)",
                     "description": f"Local checkpoint in web/checkpoints/{cid}",
-                    "recommended": (cid == "ckpt_N10000_extreme"),
+                    "recommended": (cid == "ckpt_N10000"),
                 })
                 ckpts[cid] = {
                     "id": cid,
@@ -350,6 +351,15 @@ PRESET_REGISTRY: dict[str, dict[str, Any]] = {
         "cache_dir": None,
         "is_control": False,
     },
+    "test_neisseria": {
+        "id": "test_neisseria",
+        "label": "test_neisseria — OpenRDP Empirical Benchmark (S=4, L=787 bp)",
+        "category": "Empirical Bacterial Alignment (OpenRDP Test)",
+        "description": "4 Neisseria sequences (787 bp, 62 informative sites) from OpenRDP test suite.",
+        "fasta_path": resolve_preset_fasta_path("test_neisseria.fasta", WORKSPACE_ROOT / "tools" / "openrdp" / "tests" / "test_neisseria.fasta"),
+        "cache_dir": None,
+        "is_control": False,
+    },
 }
 
 
@@ -425,6 +435,8 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         self._preset_meta_cache: Optional[list[dict[str, Any]]] = None
         self._alignment_cache: dict[str, dict[str, Any]] = {}
         self._alignment_cache_order: list[str] = []
+        self.is_warmed_up: bool = False
+        self.startup_load_ms: float = 0.0
 
     def get_alignment_window(
         self, run_id: str, start_bp: int = 0, width: int = 120
@@ -531,16 +543,25 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         self._preset_meta_cache = out
         return out
 
-    def warmup(self, checkpoint_id: str = "ckpt_N10000_extreme") -> None:
-        """Load the default checkpoint and pre-compile the static-shape JAX score function."""
+    def warmup(self, checkpoint_id: str = "ckpt_N10000") -> None:
+        """Load checkpoints (ckpt_N10000 and ckpt_N10000_extreme) once and pre-compile static-shape JAX score function."""
+        import time
+        t0 = time.perf_counter()
         registry = self._discover_checkpoints()
-        if checkpoint_id not in registry or not Path(registry[checkpoint_id]["path"]).exists():
+        target_ids = []
+        for cid in (checkpoint_id, "ckpt_N10000", "ckpt_N10000_extreme"):
+            if cid not in target_ids and cid in registry and Path(registry[cid]["path"]).exists():
+                target_ids.append(cid)
+        if not target_ids:
             avail = self.list_checkpoints()
             if not avail:
                 return
-            checkpoint_id = avail[0]["id"]
-        params, cfg, _ = self._load_checkpoint(checkpoint_id)
-        self._get_score_fn(params, cfg)
+            target_ids = [avail[0]["id"]]
+        for cid in target_ids:
+            params, cfg, _ = self._load_checkpoint(cid)
+            self._get_score_fn(params, cfg)
+        self.startup_load_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        self.is_warmed_up = True
 
     def _load_checkpoint(self, checkpoint_id: str) -> tuple[Any, M.Config, int]:
         if checkpoint_id in self._ckpt_cache:
@@ -720,13 +741,25 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     X[:, pos, g] = (code == g).sum(axis=0, dtype=np.float32) * inv_s
         return X
 
-    def _score_transformer_static(self, params: Any, cfg: M.Config, score_fn: Any, X: np.ndarray) -> np.ndarray:
+    def _score_transformer_static(
+        self,
+        params: Any,
+        cfg: M.Config,
+        score_fn: Any,
+        X: np.ndarray,
+        progress_cb: Optional[Any] = None,
+        cancel_check: Optional[Any] = None,
+    ) -> np.ndarray:
         """Score every transformed column using static-shape chunked JAX forward passes."""
         M_tx = X.shape[0]
         scores = np.empty(M_tx, dtype=np.float32)
         buf = np.zeros((self.CHUNK_SIZE, cfg.W, cfg.n_in), dtype=np.float32)
         for s in range(0, M_tx, self.CHUNK_SIZE):
+            if cancel_check is not None and cancel_check():
+                raise InterruptedError("Job cancelled by user")
             e = min(s + self.CHUNK_SIZE, M_tx)
+            if progress_cb is not None:
+                progress_cb(f"transformer windows {e} of {M_tx}")
             n = e - s
             if n == self.CHUNK_SIZE:
                 out = score_fn(params, X[s:e])
@@ -747,7 +780,15 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         fasta_filename: Optional[str] = None,
         gt_text: Optional[str] = None,
         gt_filename: Optional[str] = None,
+        progress_cb: Optional[Any] = None,
+        cancel_check: Optional[Any] = None,
+        strict_phase2: bool = False,
     ) -> InferenceResponse:
+        if progress_cb is not None:
+            progress_cb("parsing")
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Job cancelled by user")
+
         # Load checkpoint upfront (cached after first load)
         params, cfg, n_model_params = self._load_checkpoint(config.checkpoint)
         score_fn = self._get_score_fn(params, cfg)
@@ -780,13 +821,25 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         # We start an outer timing recorder once dimensions are known; measure stage 1 directly
         import time
         t_s1_start = time.perf_counter()
-        names, seqs, is_rna, gap_status = parse_and_validate_fasta(raw_fasta_str)
+        use_strict = strict_phase2 or bool(
+            fasta_filename and any(fasta_filename.startswith(pfx) for pfx in ("08", "09"))
+        )
+        names, seqs, is_rna, gap_status = parse_and_validate_fasta(
+            raw_fasta_str, strict_phase2=use_strict
+        )
+        try:
+            _, full_headers = parse_raw_fasta_records(raw_fasta_str)
+        except Exception:
+            full_headers = {n: n for n in names}
         S = len(seqs)
         L = len(seqs[0])
 
         t_s1_ms = (time.perf_counter() - t_s1_start) * 1000.0
         gc_pct, ambig_pct = compute_alignment_base_stats(seqs)
         max_pairwise_id = compute_max_pairwise_identity(seqs)
+
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Job cancelled by user")
 
         # Stage 2: Informative-site selection (strict ACGT first, gap-tolerant fallback if <30),
         # binarisation, coordinate maps & haplotype matrix
@@ -855,8 +908,13 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             gt_items = []
             has_known_gt = False
 
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Job cancelled by user")
+
         # Stage 3: Circular Moving-Window Pairwise 4-Gamete Embedding (W=314)
         need_tf = config.scoring_mode in ("hybrid_flank", "standalone_tf")
+        if need_tf and progress_cb is not None:
+            progress_cb(f"transformer windows 0 of {M_tx}")
         with recorder.measure_stage(
             stage_id="pairwise_embed",
             stage_name="3. Circular Window 4-Gamete Pairwise Embedding",
@@ -885,11 +943,16 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             ),
         ):
             if need_tf and X_embed is not None:
-                tf_raw = self._score_transformer_static(params, cfg, score_fn, X_embed)
+                tf_raw = self._score_transformer_static(
+                    params, cfg, score_fn, X_embed, progress_cb=progress_cb, cancel_check=cancel_check
+                )
                 tf_logits_b = np.concatenate([tf_raw, [tf_raw[0]]]).astype(np.float64)
             else:
                 tf_logits_b = np.zeros(M_tx + 1, dtype=np.float64)
             tf_prob_b = 1.0 / (1.0 + np.exp(-np.clip(tf_logits_b, -10.0, 10.0)))
+
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Job cancelled by user")
 
         # Adaptive bounds: dynamically adapt down to 6 for sensitive edge breakpoint recovery while protecting against extreme sub-6-site noise
         eff_min_seg = max(6, min(config.min_seg, max(6, int(M_tx * 0.01))))
@@ -899,20 +962,27 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         else:
             eff_min_seg_global = eff_min_seg
 
-        # Multi-scale window set scaled to physical sequence length for short tract (>=300 bp) and long tract sensitivity
+        # Multi-scale window set scaled to physical sequence length for short tract (>=100 bp) and long tract sensitivity
         col_density = float(M_tx) / max(float(L), 1.0)
+        w_tight = max(24, min(eff_L_w, int(100.0 * col_density)))
         w_short = max(24, min(eff_L_w, int(250.0 * col_density)))
         w_med = max(48, min(eff_L_w, int(500.0 * col_density)))
-        candidate_windows = sorted(list(set([
+        scale_windows = sorted(list(set([
             w_short,
             w_med,
             eff_L_w,
         ])))
+        scale_windows = [w for w in scale_windows if w >= 16 and w <= eff_L_w]
+        if not scale_windows:
+            scale_windows = [eff_L_w]
+        candidate_windows = sorted(list(set([w_tight] + scale_windows)))
         candidate_windows = [w for w in candidate_windows if w >= 16 and w <= eff_L_w]
         if not candidate_windows:
             candidate_windows = [eff_L_w]
 
         # Stage 5: Local Flanking KL / Global KL & Permutation Null Calibration
+        if progress_cb is not None:
+            progress_cb("KL scan")
         rng = np.random.default_rng(0)
         need_kl = config.scoring_mode in ("hybrid_flank", "flank_kl", "global_kl")
         with recorder.measure_stage(
@@ -935,12 +1005,14 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 z_kl, _raw_kl, _null_kl = H.boundary_zscore(
                     haplo, beta=config.beta, min_seg=eff_min_seg_global, kind="kl", rng=rng, n_perm=2
                 )
-                z_by_w = {eff_L_w: z_kl}
-                raw_by_w = {eff_L_w: _raw_kl}
+                z_by_w = {w: z_kl for w in candidate_windows}
+                raw_by_w = {w: _raw_kl for w in candidate_windows}
             elif config.scoring_mode in ("hybrid_flank", "flank_kl"):
                 z_by_w = {}
                 raw_by_w = {}
-                for w in candidate_windows:
+                for w in scale_windows:
+                    if cancel_check is not None and cancel_check():
+                        raise InterruptedError("Job cancelled by user")
                     z_w, raw_w, _ = H.boundary_zscore_flank(
                         haplo,
                         L_w=w,
@@ -953,14 +1025,46 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     )
                     z_by_w[w] = z_w
                     raw_by_w[w] = raw_w
-                # Combined multi-scale z profile: elementwise maximum across window scales
-                z_kl = np.maximum.reduce([z_by_w[w] for w in candidate_windows])
+                if w_tight not in z_by_w:
+                    if cancel_check is not None and cancel_check():
+                        raise InterruptedError("Job cancelled by user")
+                    z_wt, raw_wt, _ = H.boundary_zscore_flank(
+                        haplo,
+                        L_w=w_tight,
+                        beta=config.beta,
+                        min_seg=eff_min_seg,
+                        power=1.0,
+                        rng=np.random.default_rng(0),
+                        n_perm=3,
+                        origin=origin,
+                    )
+                    z_by_w[w_tight] = z_wt
+                    raw_by_w[w_tight] = raw_wt
+                # Combined multi-scale z profile across standard scales + high-confidence tight window (>= 12.0)
+                z_kl = np.maximum.reduce([z_by_w[w] for w in scale_windows])
+                if w_tight in z_by_w and w_tight not in scale_windows:
+                    z_kl = np.maximum(z_kl, np.where(z_by_w[w_tight] >= 12.0, z_by_w[w_tight], 0.0))
             else:
+                z_w, raw_tight, _ = H.boundary_zscore_flank(
+                    haplo,
+                    L_w=w_tight,
+                    beta=config.beta,
+                    min_seg=eff_min_seg,
+                    power=1.0,
+                    rng=np.random.default_rng(0),
+                    n_perm=3,
+                    origin=origin,
+                )
                 z_kl = np.zeros(M_tx + 1, dtype=np.float64)
-                z_by_w = {eff_L_w: z_kl}
-                raw_by_w = {eff_L_w: z_kl}
+                z_by_w = {w: z_w for w in candidate_windows}
+                raw_by_w = {w: raw_tight for w in candidate_windows}
+
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Job cancelled by user")
 
         # Stage 6: Peak Picking, Consolidation & 3-Level Carrier/Parent Attribution
+        if progress_cb is not None:
+            progress_cb("rendering")
         with recorder.measure_stage(
             stage_id="consolidate_3level",
             stage_name="6. Peak Consolidation & 3-Level Attribution",
@@ -1020,7 +1124,16 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 "Alignment exhibits high divergence; review signal attribution."
             )
 
+        left_edge_bp = int(origin[min(eff_min_seg - 1, M_tx - 1)]) + 1
+        right_edge_bp = max(1, int(L - int(origin[max(0, M_tx - eff_min_seg)])))
+        edge_dead_zone_bp = max(30, left_edge_bp, right_edge_bp)
+
         warnings_list: list[str] = []
+        warnings_list.append(
+            f"Edge detection limit: breakpoints within ~{edge_dead_zone_bp} bp of either alignment end "
+            f"(columns 1–{left_edge_bp} and {max(1, L - right_edge_bp)}–{L}, requiring at least "
+            f"{eff_min_seg} informative sites per flank) cannot be detected."
+        )
         if is_rna:
             warnings_list.append("RNA input detected (U->T normalized)")
         if info_mode == "gap_tolerant":
@@ -1060,9 +1173,11 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 window_size=cfg.W,
                 null_policy=config.null_policy,
                 sequence_names=names,
+                full_headers=full_headers,
                 gc_content_pct=gc_pct,
                 ambiguity_pct=ambig_pct,
                 is_rna=is_rna,
+                edge_dead_zone_bp=edge_dead_zone_bp,
             ),
             timings=timings,
             consolidated_events=events,
@@ -1095,15 +1210,17 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             tf_logits_b > 0.5, 7.0 * (tf_logits_b - 0.5), 0.0
         ) * gate_linkage
 
-        # Pick candidate peaks depending on scoring mode
-        peak_sources: dict[int, str] = {}
-        if config.scoring_mode == "flank_kl":
-            kl_peaks_raw = H.pick_peaks(z_kl, config.z_thresh, radius=15, max_peaks=64)
-            refined_kl_peaks = []
+        w_tight = min(candidate_windows) if candidate_windows else 16
+
+        def _refine_kl_peaks(kl_peaks_raw: list[int]) -> list[int]:
+            # First identify genuine peaks (filtering out greedy pick_peaks mask cliffs on monotonic slopes)
+            genuine_raw: list[int] = []
             for p in kl_peaks_raw:
                 p_int = int(p)
                 lo = max(eff_min_seg, p_int - 8)
                 hi = min(M_tx - eff_min_seg, p_int + 8)
+                if lo > hi:
+                    continue
                 sub_idx = np.arange(lo, hi + 1)
                 best_w = candidate_windows[0]
                 best_z = -1.0
@@ -1113,8 +1230,46 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                         best_z = max_z_w
                         best_w = w
                 best_b = int(sub_idx[np.argmax(raw_by_w[best_w][sub_idx])])
-                refined_kl_peaks.append(best_b)
-            kl_peaks = sorted(list(set(refined_kl_peaks)))
+                tight_max_z = float(np.max(z_by_w[w_tight][sub_idx])) if w_tight in z_by_w else best_z
+                if tight_max_z < config.z_thresh:
+                    if (best_b == lo and lo > eff_min_seg and raw_by_w[best_w][lo - 1] > raw_by_w[best_w][best_b]) or (
+                        best_b == hi and hi < (M_tx - eff_min_seg) and raw_by_w[best_w][hi + 1] > raw_by_w[best_w][best_b]
+                    ):
+                        continue
+                    if (lo > eff_min_seg and z_kl[lo - 1] > z_kl[best_b] * 1.02) or (
+                        hi < (M_tx - eff_min_seg) and z_kl[hi + 1] > z_kl[best_b] * 1.02
+                    ):
+                        continue
+                genuine_raw.append(p_int)
+
+            refined: list[int] = []
+            for p_int in genuine_raw:
+                lo = max(eff_min_seg, p_int - 8)
+                hi = min(M_tx - eff_min_seg, p_int + 8)
+                sub_idx = np.arange(lo, hi + 1)
+                min_dist_other = min([abs(q - p_int) for q in genuine_raw if q != p_int], default=M_tx)
+                valid_ws = [
+                    w for w in candidate_windows
+                    if w <= (min_dist_other + 4) and float(np.max(z_by_w[w][sub_idx])) >= config.z_thresh
+                ]
+                if not valid_ws:
+                    valid_ws = [w_tight] if (w_tight in z_by_w and float(np.max(z_by_w[w_tight][sub_idx])) >= config.z_thresh) else candidate_windows
+                best_w = valid_ws[0]
+                best_z = -1.0
+                for w in valid_ws:
+                    max_z_w = float(np.max(z_by_w[w][sub_idx]))
+                    if max_z_w > best_z:
+                        best_z = max_z_w
+                        best_w = w
+                best_b = int(sub_idx[np.argmax(raw_by_w[best_w][sub_idx])])
+                refined.append(best_b)
+            return sorted(list(set(refined)))
+
+        # Pick candidate peaks depending on scoring mode
+        peak_sources: dict[int, str] = {}
+        if config.scoring_mode == "flank_kl":
+            kl_peaks_raw = H.pick_peaks(z_kl, config.z_thresh, radius=15, max_peaks=64)
+            kl_peaks = _refine_kl_peaks(kl_peaks_raw)
             for b in kl_peaks:
                 peak_sources[int(b)] = "flank_kl"
             ordered_peaks = kl_peaks
@@ -1126,30 +1281,29 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             ordered_peaks = kl_peaks
             pick_by = "score"
         elif config.scoring_mode == "standalone_tf":
-            tf_peaks = H.pick_peaks(tf_logits_b, config.tf_logit_thresh, radius=20, max_peaks=64)
+            # In standalone_tf mode, the W=314 window scores 4-gamete regions; pin exact switch boundaries
+            # inside Transformer-positive regions using tight local haplotype switch z-score
+            z_tight = z_by_w.get(w_tight)
+            if z_tight is not None and np.any(tf_logits_b >= config.tf_logit_thresh):
+                tf_pos_mask = np.zeros(M_tx + 1, dtype=bool)
+                pos_indices = np.flatnonzero(tf_logits_b >= config.tf_logit_thresh)
+                for idx_p in pos_indices:
+                    tf_pos_mask[max(0, int(idx_p) - 10) : min(M_tx + 1, int(idx_p) + 11)] = True
+                gated_z = np.where(tf_pos_mask, z_tight, 0.0)
+                tf_peaks_raw = H.pick_peaks(gated_z, config.z_thresh, radius=15, max_peaks=64)
+                tf_peaks = _refine_kl_peaks(tf_peaks_raw) if tf_peaks_raw else []
+                if not tf_peaks:
+                    tf_peaks = H.pick_peaks(tf_logits_b, config.tf_logit_thresh, radius=20, max_peaks=64)
+            else:
+                tf_peaks = H.pick_peaks(tf_logits_b, config.tf_logit_thresh, radius=20, max_peaks=64)
             for b in tf_peaks:
                 peak_sources[int(b)] = "transformer"
-            ordered_peaks = tf_peaks
+            ordered_peaks = sorted(list(set(int(b) for b in tf_peaks)))
             pick_by = "score"
         else:
             # hybrid_flank: combine calibrated flank_kl peaks + non-overlapping confirmed TF peaks
             kl_peaks_raw = H.pick_peaks(z_kl, config.z_thresh, radius=15, max_peaks=64)
-            refined_kl_peaks = []
-            for p in kl_peaks_raw:
-                p_int = int(p)
-                lo = max(eff_min_seg, p_int - 8)
-                hi = min(M_tx - eff_min_seg, p_int + 8)
-                sub_idx = np.arange(lo, hi + 1)
-                best_w = candidate_windows[0]
-                best_z = -1.0
-                for w in candidate_windows:
-                    max_z_w = float(np.max(z_by_w[w][sub_idx]))
-                    if max_z_w > best_z:
-                        best_z = max_z_w
-                        best_w = w
-                best_b = int(sub_idx[np.argmax(raw_by_w[best_w][sub_idx])])
-                refined_kl_peaks.append(best_b)
-            kl_peaks = sorted(list(set(refined_kl_peaks)))
+            kl_peaks = _refine_kl_peaks(kl_peaks_raw)
             tf_peaks = H.pick_peaks(tf_logits_b, config.tf_logit_thresh, radius=20, max_peaks=64)
             for b in kl_peaks:
                 peak_sources[int(b)] = "flank_kl"
@@ -1160,6 +1314,9 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     near_k = min(near_kl, key=lambda k: abs(int(k) - int(b_tf)))
                     peak_sources[int(near_k)] = "hybrid"
                 elif all(abs(int(b_tf) - int(b_m)) > 20 for b_m in merged_peaks):
+                    # Check that b_tf is a genuine tight-window local switch peak, not a broad-window shoulder
+                    if w_tight in z_by_w and float(z_by_w[w_tight][int(b_tf)]) < config.z_thresh:
+                        continue
                     if len(merged_peaks) < 64:
                         merged_peaks.append(int(b_tf))
                         peak_sources[int(b_tf)] = "transformer"
@@ -1187,8 +1344,9 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             else:
                 best_detail = []
                 best_sw = 0.0
-                best_w_used = candidate_windows[0] if candidate_windows else eff_L_w
-                for w in candidate_windows:
+                std_windows = [w for w in candidate_windows if w > w_tight] or candidate_windows
+                best_w_used = std_windows[0] if std_windows else eff_min_seg
+                for w in std_windows:
                     dt = H.flank_soft_switch_detail(
                         haplo,
                         b_int,
@@ -1205,9 +1363,49 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                         best_detail = dt
                         best_w_used = w
 
+                # When tight window has strong independent z-score (>= 15.0), use tight window for carrier/parent attribution
+                # so adjacent breakpoints ~100 bp away do not bleed into the flanking window
+                if w_tight in z_by_w and float(z_by_w[w_tight][b_int]) >= 15.0:
+                    dt_tight = H.flank_soft_switch_detail(
+                        haplo,
+                        b_int,
+                        L_w=w_tight,
+                        beta=config.beta,
+                        min_seg=eff_min_seg,
+                        kind="kl",
+                        top_members=20,
+                        member_frac=0.5,
+                        top_parents=5,
+                    )
+                    if dt_tight and dt_tight[0]["switch"] >= 0.85 * best_sw and dt_tight[0]["switch"] >= 3.0:
+                        best_detail = dt_tight
+
                 detail = best_detail
                 if not detail:
                     continue
+
+                # Filter out reciprocal mirror-donor artifacts from detail:
+                # When recombinant R copies donor P on one flank, P's closest relative on that flank
+                # becomes R (yielding a mirror switch score for P), while P remains in its own parental
+                # clade across the boundary. True sibling carriers match R on BOTH flanks.
+                filtered_detail = [detail[0]]
+                higher_seqs = {int(detail[0]["recombinant"])}
+                higher_parents = {int(detail[0]["parent_left"]), int(detail[0]["parent_right"])}
+                for cand in detail[1:]:
+                    c_seq = int(cand["recombinant"])
+                    c_pL = int(cand["parent_left"])
+                    c_pR = int(cand["parent_right"])
+                    one_side_mirror = (c_pL in higher_seqs) != (c_pR in higher_seqs)
+                    ext_l = [x for x in cand.get("left_candidates", []) if int(x["seq"]) not in higher_seqs]
+                    ext_r = [x for x in cand.get("right_candidates", []) if int(x["seq"]) not in higher_seqs]
+                    ext_same_clade = bool(ext_l and ext_r and int(ext_l[0]["seq"]) == int(ext_r[0]["seq"]))
+                    if one_side_mirror or (c_seq in higher_parents and ext_same_clade):
+                        continue
+                    filtered_detail.append(cand)
+                    higher_seqs.add(c_seq)
+                    higher_parents.add(c_pL)
+                    higher_parents.add(c_pR)
+                detail = filtered_detail
 
                 z_val = float(z_kl[b_int])
                 tf_peak = float(tf_logits_b[b_int])
@@ -1284,16 +1482,20 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                                 if local_max_tf < config.tf_logit_thresh and best_sw < 1.0:
                                     continue
 
-                        # Truncated flanking windows (w_eff < 48 or b_orig < 50 or b_orig > L - 50):
-                        # Require best_sw >= 1.5 or local_max_tf >= 0.5.
-                        if w_eff < 48 or b_orig < 50 or b_orig > (L - 50):
+                        # Truncated flanking windows (w_eff < 48 or b_orig <= 50 or b_orig >= L - 50):
+                        # Require best_sw >= 1.5 or local_max_tf >= 0.5, and if z_val < 7.0 require tight-window confirmation.
+                        if w_eff < 48 or b_orig <= 50 or b_orig >= (L - 50):
                             if best_sw < 1.5 and local_max_tf < 0.5:
+                                continue
+                            if z_val < 7.0 and w_tight in z_by_w and float(z_by_w[w_tight][b_int]) < config.z_thresh:
                                 continue
 
                 elif config.scoring_mode == "flank_kl":
                     # Truncated flanking windows and short alignments under flank_kl mode
-                    if w_eff < 48 or b_orig < 50 or b_orig > (L - 50):
+                    if w_eff < 48 or b_orig <= 50 or b_orig >= (L - 50):
                         if best_sw < 1.5:
+                            continue
+                        if z_val < 7.0 and w_tight in z_by_w and float(z_by_w[w_tight][b_int]) < config.z_thresh:
                             continue
                     if M_tx < 314:
                         if z_val < 10.5 or best_sw < 2.0:
@@ -1330,11 +1532,63 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 "hybrid": float(hybrid_profile[b_int]),
             }
 
+        # Suppress weaker shoulder echoes that repeat the exact same (recombinant, parent_left, parent_right)
+        # transition within 200 bp with no opposite switch in between
+        if len(raw_for_cons) >= 2:
+            filtered_raw: list[dict[str, Any]] = []
+            for idx_p, rp in enumerate(raw_for_cons):
+                r_list = rp.get("recombinants", [])
+                if not r_list:
+                    filtered_raw.append(rp)
+                    continue
+                r0 = r_list[0]
+                sig = (int(r0["recombinant"]), int(r0["parent_left"]), int(r0["parent_right"]))
+                bp_i = int(rp["breakpoint_orig"])
+                sc_i = float(rp["score"]) * float(r0.get("switch", 1.0))
+                is_shoulder_echo = False
+                for idx_q, rq in enumerate(raw_for_cons):
+                    if idx_q == idx_p:
+                        continue
+                    rq_list = rq.get("recombinants", [])
+                    if not rq_list:
+                        continue
+                    rq0 = rq_list[0]
+                    sig_q = (int(rq0["recombinant"]), int(rq0["parent_left"]), int(rq0["parent_right"]))
+                    bp_q = int(rq["breakpoint_orig"])
+                    sc_q = float(rq["score"]) * float(rq0.get("switch", 1.0))
+                    if sig == sig_q and abs(bp_i - bp_q) <= 200 and sc_q > sc_i:
+                        is_shoulder_echo = True
+                        break
+                if not is_shoulder_echo:
+                    filtered_raw.append(rp)
+            raw_for_cons = filtered_raw
+
         cons_list = REP.consolidate_peaks(
             raw_for_cons,
             merge_radius_bp=config.merge_radius_bp,
             pick_by=pick_by,
         )
+
+        # Phase 3 Step 5: Enforce paired-breakpoint carrier rule on internal tracts
+        # When an alignment has paired breakpoints (at least one sequence carries >= 2 events),
+        # remove secondary single-breakpoint leak candidates from events whose primary carrier is paired.
+        if len(cons_list) >= 2:
+            seq_ev_counts: dict[int, int] = {}
+            for ev in cons_list:
+                for r in ev.get("recombinants", []):
+                    s_id = int(r["recombinant"])
+                    seq_ev_counts[s_id] = seq_ev_counts.get(s_id, 0) + 1
+            if any(cnt >= 2 for cnt in seq_ev_counts.values()):
+                for ev in cons_list:
+                    r_list = ev.get("recombinants", [])
+                    if len(r_list) > 1 and seq_ev_counts.get(int(r_list[0]["recombinant"]), 0) >= 2:
+                        kept_r = [r_list[0]]
+                        for r_sec in r_list[1:]:
+                            s_sec = int(r_sec["recombinant"])
+                            if seq_ev_counts.get(s_sec, 0) >= 2:
+                                kept_r.append(r_sec)
+                        ev["recombinants"] = kept_r
+                        ev["all_carrier_seqs"] = sorted(list({int(r["recombinant"]) for r in kept_r}))
 
         # Map each raw peak's orig coordinate to its consolidated event_id
         orig_to_event_id: dict[int, int] = {}
@@ -1344,6 +1598,22 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
 
         def sname(idx: int) -> str:
             return seq_names[idx] if 0 <= idx < len(seq_names) else f"Seq_{idx}"
+
+        def format_parent_with_ties(ext_cands: list[dict[str, Any]], fallback_idx: int) -> str:
+            if not ext_cands:
+                return sname(fallback_idx)
+            c0 = ext_cands[0]
+            name0 = sname(int(c0["seq"]))
+            if len(ext_cands) >= 2:
+                c1 = ext_cands[1]
+                sim0 = float(c0["sim"])
+                sim1 = float(c1["sim"])
+                margin = 0.01 if sim0 >= 0.999 else 0.05
+                if sim0 >= 0.80 and (sim0 - sim1) <= margin:
+                    name1 = sname(int(c1["seq"]))
+                    if name1 != name0:
+                        return f"{name0} or {name1}"
+            return name0
 
         consolidated_events: list[ConsolidatedEvent] = []
         for ev in cons_list:
@@ -1365,8 +1635,12 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 pR = int(r["parent_right"])
                 l_cands = r.get("left_candidates", [])
                 r_cands = r.get("right_candidates", [])
-                ext_L = next((int(c["seq"]) for c in l_cands if int(c["seq"]) not in carrier_set), pL)
-                ext_R = next((int(c["seq"]) for c in r_cands if int(c["seq"]) not in carrier_set), pR)
+                ext_l_cands = [c for c in l_cands if int(c["seq"]) not in carrier_set]
+                ext_r_cands = [c for c in r_cands if int(c["seq"]) not in carrier_set]
+                ext_L = int(ext_l_cands[0]["seq"]) if ext_l_cands else pL
+                ext_R = int(ext_r_cands[0]["seq"]) if ext_r_cands else pR
+                ext_L_name = format_parent_with_ties(ext_l_cands, ext_L)
+                ext_R_name = format_parent_with_ties(ext_r_cands, ext_R)
 
                 recombs_out.append(
                     RecombinantCall(
@@ -1379,9 +1653,9 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                         parent_right=pR,
                         parent_right_name=sname(pR),
                         ext_parent_left=ext_L,
-                        ext_parent_left_name=sname(ext_L),
+                        ext_parent_left_name=ext_L_name,
                         ext_parent_right=ext_R,
-                        ext_parent_right_name=sname(ext_R),
+                        ext_parent_right_name=ext_R_name,
                         left_sim=round(float(r.get("left_sim", 0.0)), 4),
                         right_sim=round(float(r.get("right_sim", 0.0)), 4),
                         left_candidates=[

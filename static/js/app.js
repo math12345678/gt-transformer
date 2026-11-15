@@ -22,6 +22,8 @@
     "#556677", // slate
   ];
 
+  const EMPTY_STATE_MSG = "Open a FASTA alignment or pick a demo, then press Run.";
+
   const state = {
     sourceMode: "preset",
     uploadedFastaFile: null,
@@ -41,6 +43,9 @@
     timingHistory: [],
     annotations: [],
     canvasMarkers: [],
+    activeJobId: null,
+    jobTimerInterval: null,
+    jobStartTimeMs: 0,
   };
 
   const el = (id) => document.getElementById(id);
@@ -61,6 +66,17 @@
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
+  }
+
+  function getFullHeader(name) {
+    if (!name) return "";
+    const map =
+      state.currentRun &&
+      state.currentRun.alignment &&
+      state.currentRun.alignment.full_headers
+        ? state.currentRun.alignment.full_headers
+        : null;
+    return (map && map[name]) || name;
   }
 
   function showGlobalError(message) {
@@ -91,11 +107,65 @@
     if (banner) banner.classList.add("hidden");
   }
 
+  function clearResultsArea(emptyMessage = EMPTY_STATE_MSG) {
+    state.currentRun = null;
+    state.selectedEventId = null;
+    state.selectedCarrierSeqIdx = null;
+    state.lastAlnWindow = null;
+    state.canvasMarkers = [];
+
+    el("sumDimensions").textContent = "—";
+    el("sumCols").textContent = "—";
+    el("sumEvents").textContent = "—";
+    el("sumRecall").textContent = "—";
+    el("sumPrecision").textContent = "—";
+    el("sumMedErr").textContent = "—";
+    el("sumTime").textContent = "—";
+    const wBadge = el("sumWarningsTag");
+    if (wBadge) wBadge.classList.add("hidden");
+
+    const stageLine = el("stageTimingSummaryLine");
+    if (stageLine) {
+      stageLine.textContent = "";
+      stageLine.classList.add("hidden");
+    }
+
+    el("presetMetaLine").textContent = emptyMessage;
+    el("alnPaneTitle").textContent = "Sequence Alignment (No active run)";
+    el("alnMatrixContainer").innerHTML =
+      `<div class="mono-muted" style="padding:12px;">${escapeHtml(emptyMessage)}</div>`;
+    el("alnSeqList").innerHTML = "";
+    el("level1EventsBody").innerHTML =
+      `<tr><td colspan="10" class="mono-muted">${escapeHtml(emptyMessage)}</td></tr>`;
+    el("level2CarriersBody").innerHTML = `<tr><td colspan="7">No event selected.</td></tr>`;
+    el("level3ParentsContainer").innerHTML = `<div class="mono-muted">No carrier selected.</div>`;
+    el("toleranceMetricsBody").innerHTML = "";
+    el("gtDiagnosticBody").innerHTML = "";
+    el("predDiagnosticBody").innerHTML = "";
+    el("currentTimingBody").innerHTML = "";
+    const wBox = el("diagnosticsWarningsBox");
+    if (wBox) wBox.classList.add("hidden");
+
+    // Clear canvases
+    ["overviewStripCanvas", "genomeTrackCanvas", "mosaicMapCanvas"].forEach((cid) => {
+      const c = el(cid);
+      if (!c) return;
+      const ctx = c.getContext("2d");
+      if (ctx) {
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.restore();
+      }
+    });
+  }
+
   async function init() {
     bindUIEvents();
     await loadPresetsAndConfig();
     await Promise.all([loadTimingHistory(), loadAnnotations(), loadBenchmarkSummaries()]);
-    await submitInference();
+    clearResultsArea(EMPTY_STATE_MSG);
   }
 
   function bindUIEvents() {
@@ -105,11 +175,34 @@
         upOpt.remove();
       }
       state.sourceMode = "preset";
-      submitInference();
+      // Phase 1: Do NOT auto-run on preset change. Keep last finished result visible until Run is pressed.
     });
 
     el("btnRunTop").addEventListener("click", submitInference);
     el("btnRunSide").addEventListener("click", submitInference);
+
+    if (el("btnCancelJobTop")) el("btnCancelJobTop").addEventListener("click", cancelActiveJob);
+    if (el("btnCancelJobSide")) el("btnCancelJobSide").addEventListener("click", cancelActiveJob);
+    if (el("btnCancelJobBanner")) el("btnCancelJobBanner").addEventListener("click", cancelActiveJob);
+
+    if (el("btnToggleHowToUse")) {
+      el("btnToggleHowToUse").addEventListener("click", () => {
+        const p = el("howToUsePanel");
+        if (p) p.classList.toggle("hidden");
+      });
+    }
+    if (el("btnCloseHowToUse")) {
+      el("btnCloseHowToUse").addEventListener("click", () => {
+        const p = el("howToUsePanel");
+        if (p) p.classList.add("hidden");
+      });
+    }
+    if (el("btnDownloadCsvGuide")) {
+      el("btnDownloadCsvGuide").addEventListener("click", exportBreakpointsCsv);
+    }
+    if (el("btnDownloadJsonGuide")) {
+      el("btnDownloadJsonGuide").addEventListener("click", exportFullJson);
+    }
 
     el("scoringModeSelect").addEventListener("change", () => {
       const m = el("scoringModeSelect").value;
@@ -159,7 +252,6 @@
       el("gtFileInput").value = "";
       el("pastedGtInput").value = "";
       closeUploadModal();
-      submitInference();
     });
     el("uploadForm").addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -270,7 +362,7 @@
   function updateIniPreview() {
     const ini = [
       `[GTTransformer]`,
-      `checkpoint = ${el("checkpointSelect").value || "ckpt_N10000_extreme"}`,
+      `checkpoint = ${el("checkpointSelect").value || "ckpt_N10000"}`,
       `scoring_mode = ${el("scoringModeSelect").value || "hybrid_flank"}`,
       `null_policy = ${el("nullPolicyInput").value}`,
       `tf_logit_thresh = ${el("tfLogitThreshInput").value}`,
@@ -304,13 +396,66 @@
     updateIniPreview();
   }
 
-  async function submitInference() {
+  function setJobRunningUI(isRunning, statusLabel = "Running", stageLabel = "parsing") {
     const btnTop = el("btnRunTop");
     const btnSide = el("btnRunSide");
-    btnTop.disabled = true;
-    btnSide.disabled = true;
-    btnTop.textContent = "Running...";
-    btnSide.textContent = "Running...";
+    const cancelTop = el("btnCancelJobTop");
+    const cancelSide = el("btnCancelJobSide");
+    const statusBar = el("jobStatusBar");
+    const statusBadge = el("jobStatusBadge");
+    const stageText = el("jobStageText");
+
+    btnTop.disabled = isRunning;
+    btnSide.disabled = isRunning;
+    btnTop.textContent = isRunning ? statusLabel : "Run";
+    btnSide.textContent = isRunning ? statusLabel : "Run";
+
+    if (cancelTop) cancelTop.classList.toggle("hidden", !isRunning);
+    if (cancelSide) cancelSide.classList.toggle("hidden", !isRunning);
+    if (statusBar) statusBar.classList.toggle("hidden", !isRunning);
+    if (statusBadge) statusBadge.textContent = statusLabel;
+    if (stageText) stageText.textContent = `Stage: ${stageLabel}`;
+  }
+
+  function startClientElapsedTimer() {
+    stopClientElapsedTimer();
+    state.jobStartTimeMs = Date.now();
+    const elapsedEl = el("jobElapsedText");
+    if (elapsedEl) elapsedEl.textContent = "(0.0 s)";
+    state.jobTimerInterval = setInterval(() => {
+      const sec = (Date.now() - state.jobStartTimeMs) / 1000;
+      if (elapsedEl) elapsedEl.textContent = `(${sec.toFixed(1)} s)`;
+    }, 200);
+  }
+
+  function stopClientElapsedTimer() {
+    if (state.jobTimerInterval) {
+      clearInterval(state.jobTimerInterval);
+      state.jobTimerInterval = null;
+    }
+  }
+
+  async function cancelActiveJob() {
+    if (!state.activeJobId) return;
+    try {
+      await fetch(`/api/jobs/${encodeURIComponent(state.activeJobId)}/cancel`, {
+        method: "POST",
+      });
+    } catch (err) {
+      console.error("Cancel request failed:", err);
+    }
+  }
+
+  function sleepMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function submitInference() {
+    // Phase 1: Clear old results and old error banner immediately on Run
+    hideGlobalError();
+    clearResultsArea("Running recombination analysis...");
+    setJobRunningUI(true, "Queued", "parsing");
+    startClientElapsedTimer();
 
     try {
       const fd = new FormData();
@@ -339,38 +484,74 @@
         }
       }
 
-      hideGlobalError();
       let res;
       try {
-        res = await fetch("/api/infer", { method: "POST", body: fd });
+        res = await fetch("/api/jobs", { method: "POST", body: fd });
       } catch (netErr) {
+        clearResultsArea(EMPTY_STATE_MSG);
         showGlobalError("Network error: Unable to connect to inference server (" + (netErr.message || "offline") + ")");
         return;
       }
+
       if (!res.ok) {
         const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}: ${res.statusText}` }));
-        showGlobalError(err.detail || `Inference failed with status ${res.status}`);
+        clearResultsArea(EMPTY_STATE_MSG);
+        showGlobalError(err.detail || `Validation failed with status ${res.status}`);
         return;
       }
 
-      const data = await res.json();
-      state.currentRun = data;
-      const evs = data.consolidated_events || [];
-      state.selectedEventId = evs.length > 0 ? evs[0].event_id : null;
-      state.selectedCarrierSeqIdx =
-        evs.length > 0 && evs[0].recombinants && evs[0].recombinants.length > 0
-          ? evs[0].recombinants[0].seq_idx
-          : null;
+      const jobInit = await res.json();
+      const jobId = jobInit.job_id;
+      state.activeJobId = jobId;
 
-      renderRun(data);
-      const startBp =
-        evs.length > 0 ? Math.max(0, evs[0].most_plausible_bp_orig - Math.floor(state.alnWidth / 2)) : 0;
-      await Promise.all([loadAlignmentWindow(startBp), loadTimingHistory()]);
+      // Poll GET /api/jobs/<id> every 1 s
+      while (state.activeJobId === jobId) {
+        const pollRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+        if (!pollRes.ok) {
+          const pollErr = await pollRes.json().catch(() => ({ detail: `HTTP ${pollRes.status}` }));
+          clearResultsArea(EMPTY_STATE_MSG);
+          showGlobalError(pollErr.detail || `Failed to poll job ${jobId}`);
+          return;
+        }
+        const job = await pollRes.json();
+        const statusCap = job.status === "queued" ? "Queued" : "Running";
+        setJobRunningUI(true, statusCap, job.stage || "running");
+
+        if (job.status === "done" && job.result) {
+          const data = job.result;
+          state.currentRun = data;
+          const evs = data.consolidated_events || [];
+          state.selectedEventId = evs.length > 0 ? evs[0].event_id : null;
+          state.selectedCarrierSeqIdx =
+            evs.length > 0 && evs[0].recombinants && evs[0].recombinants.length > 0
+              ? evs[0].recombinants[0].seq_idx
+              : null;
+
+          renderRun(data);
+          const startBp =
+            evs.length > 0 ? Math.max(0, evs[0].most_plausible_bp_orig - Math.floor(state.alnWidth / 2)) : 0;
+          await Promise.all([loadAlignmentWindow(startBp), loadTimingHistory()]);
+          return;
+        }
+
+        if (job.status === "error") {
+          clearResultsArea(EMPTY_STATE_MSG);
+          showGlobalError(job.error || "Inference job failed.");
+          return;
+        }
+
+        if (job.status === "cancelled") {
+          clearResultsArea(EMPTY_STATE_MSG);
+          showGlobalError(job.error || "Job cancelled by user.");
+          return;
+        }
+
+        await sleepMs(1000);
+      }
     } finally {
-      btnTop.disabled = false;
-      btnSide.disabled = false;
-      btnTop.textContent = "Run";
-      btnSide.textContent = "Run";
+      state.activeJobId = null;
+      stopClientElapsedTimer();
+      setJobRunningUI(false);
     }
   }
 
@@ -408,11 +589,21 @@
     }
     el("sumTime").textContent = `${tim.total_ms.toFixed(0)} ms (${fmtInt(Math.round(tim.throughput_bp_per_sec))} bp/s)`;
 
+    const stageLine = el("stageTimingSummaryLine");
+    if (stageLine) {
+      if (tim.stage_summary_line) {
+        stageLine.textContent = tim.stage_summary_line;
+        stageLine.classList.remove("hidden");
+      } else {
+        stageLine.classList.add("hidden");
+      }
+    }
+
     const warnings = run.warnings || [];
     const wBadge = el("sumWarningsTag");
     if (wBadge) {
       if (warnings.length > 0) {
-        wBadge.textContent = `⚠️ ${warnings.length} OOD Warning${warnings.length > 1 ? "s" : ""}`;
+        wBadge.textContent = `⚠️ ${warnings.length} Warning${warnings.length > 1 ? "s" : ""}`;
         wBadge.title = warnings.join("\n") + "\n(Click to view in Diagnostics tab)";
         wBadge.classList.remove("hidden");
         wBadge.onclick = () => switchTab("tab-diagnostics");
@@ -422,7 +613,7 @@
     }
 
     el("presetMetaLine").textContent =
-      `${aln.dataset_name} (${aln.source_type}) | mode=${run.config.scoring_mode} | ckpt=${run.config.checkpoint} | GC=${aln.gc_content_pct}%`;
+      `${aln.dataset_name} (${aln.source_type}) | mode=${run.config.scoring_mode} | ckpt=${run.config.checkpoint} | GC=${aln.gc_content_pct}% | Edge dead-zone: ±${aln.edge_dead_zone_bp || 30} bp`;
 
     drawOverviewStrip(run);
     drawGenomeTrack(run);
@@ -513,7 +704,8 @@
           if (absPos === evBp) clsList.push("nt-bp");
           seqHtml += `<span class="${clsList.join(" ")}">${escapeHtml(txt[k])}</span>`;
         }
-        return `<tr class="${cls}"><td class="aln-row-idx">${row.seq_idx}</td><td>${seqHtml}</td></tr>`;
+        const fullHdr = getFullHeader(row.name);
+        return `<tr class="${cls}"><td class="aln-row-idx" title="${escapeHtml(fullHdr)}">${row.seq_idx}: ${escapeHtml(row.name)}</td><td>${seqHtml}</td></tr>`;
       })
       .join("");
 
@@ -527,7 +719,8 @@
         const isP = !isC && parentSet.has(row.seq_idx);
         const cls = isC ? "seq-list-item is-carrier" : isP ? "seq-list-item is-parent" : "seq-list-item";
         const tag = isC ? " [REC]" : isP ? " [PAR]" : "";
-        return `<div class="${cls}" title="${escapeHtml(row.name)}">${row.seq_idx}: ${escapeHtml(row.name)}${tag}</div>`;
+        const fullHdr = getFullHeader(row.name);
+        return `<div class="${cls}" title="${escapeHtml(fullHdr)}">${row.seq_idx}: ${escapeHtml(row.name)}${tag}</div>`;
       })
       .join("");
   }
@@ -576,7 +769,17 @@
       .map((ev) => {
         const sel = ev.event_id === state.selectedEventId ? ' class="selected-row"' : "";
         const lead = ev.recombinants && ev.recombinants[0] ? ev.recombinants[0] : null;
-        const parentsStr = lead ? `${lead.ext_parent_left} → ${lead.ext_parent_right}` : "—";
+        const parentsStr = lead
+          ? `${lead.ext_parent_left_name || lead.ext_parent_left} → ${lead.ext_parent_right_name || lead.ext_parent_right}`
+          : "—";
+        const carrierNames = (ev.recombinants || []).map((r) => r.seq_name || String(r.seq_idx));
+        const carrierDisplay =
+          carrierNames.length > 0
+            ? carrierNames.slice(0, 6).join(", ")
+            : ev.recombinant_sequences.slice(0, 6).join(", ");
+        const carrierTooltips = (ev.recombinants || [])
+          .map((r) => getFullHeader(r.seq_name))
+          .join("\n");
         const attrLabels = {
           "hybrid_flank": "Hybrid",
           "flank_kl_heuristic_only": "flank_kl (heuristic)",
@@ -594,7 +797,7 @@
           `<td class="num">${ev.n_peaks_consolidated}</td>` +
           `<td class="num">${ev.score_z.toFixed(2)}</td>` +
           `<td class="mono">${ev.tf_logit.toFixed(2)} (${ev.tf_prob.toFixed(2)})</td>` +
-          `<td class="mono">${escapeHtml(ev.recombinant_sequences.slice(0, 6).join(","))}</td>` +
+          `<td class="mono" title="${escapeHtml(carrierTooltips)}">${escapeHtml(carrierDisplay)}</td>` +
           `<td class="mono">${escapeHtml(parentsStr)}</td>` +
           `<td>${statusTagHtml(ev.match_status)}</td>` +
           `</tr>`
@@ -623,13 +826,16 @@
     l2Body.innerHTML = recombs
       .map((r) => {
         const sel = r.seq_idx === state.selectedCarrierSeqIdx ? ' class="selected-row"' : "";
+        const fullHdr = getFullHeader(r.seq_name);
+        const pLeftStr = `${r.ext_parent_left_name || r.parent_left_name} (#${r.ext_parent_left})`;
+        const pRightStr = `${r.ext_parent_right_name || r.parent_right_name} (#${r.ext_parent_right})`;
         return (
           `<tr${sel} data-row-carrier="${r.seq_idx}">` +
           `<td class="num"><strong>${r.seq_idx}</strong></td>` +
-          `<td class="mono">${escapeHtml(r.seq_name)}</td>` +
+          `<td class="mono" title="${escapeHtml(fullHdr)}">${escapeHtml(r.seq_name)}</td>` +
           `<td class="num">${fmtFloat(r.p_switch, 4)}</td>` +
-          `<td class="mono">${r.parent_left} (ext: ${r.ext_parent_left})</td>` +
-          `<td class="mono">${r.parent_right} (ext: ${r.ext_parent_right})</td>` +
+          `<td class="mono">${escapeHtml(pLeftStr)}</td>` +
+          `<td class="mono">${escapeHtml(pRightStr)}</td>` +
           `<td class="num">${fmtFloat(r.left_sim, 4)}</td>` +
           `<td class="num">${fmtFloat(r.right_sim, 4)}</td>` +
           `</tr>`
@@ -659,7 +865,7 @@
             `<tr>` +
             `<td class="num">#${i + 1}</td>` +
             `<td class="num"><strong>${c.seq_idx}</strong></td>` +
-            `<td class="mono">${escapeHtml(c.seq_name)}</td>` +
+            `<td class="mono" title="${escapeHtml(getFullHeader(c.seq_name))}">${escapeHtml(c.seq_name)}</td>` +
             `<td class="num">${fmtFloat(c.similarity, 4)}</td>` +
             `<td class="mono">${c.is_external_to_event ? "external" : "co-carrier"}</td>` +
             `</tr>`
@@ -1226,8 +1432,10 @@
       ctx.fillStyle = isSel ? "#000000" : "#333333";
       ctx.font = isSel ? "bold 10.5px Consolas, monospace" : "10.5px Consolas, monospace";
       ctx.textAlign = "left";
+      const pLName = r.ext_parent_left_name || r.ext_parent_left;
+      const pRName = r.ext_parent_right_name || r.ext_parent_right;
       ctx.fillText(
-        `Ev#${ev.event_id} Seq ${r.seq_idx} (${r.seq_name.slice(0, 18)}) | P_L=${r.ext_parent_left} (${(r.left_sim * 100).toFixed(1)}%) → P_R=${r.ext_parent_right} (${(r.right_sim * 100).toFixed(1)}%) @ ${bp} bp`,
+        `Ev#${ev.event_id} Seq ${r.seq_idx} (${r.seq_name.slice(0, 18)}) | P_L=${pLName} (${(r.left_sim * 100).toFixed(1)}%) → P_R=${pRName} (${(r.right_sim * 100).toFixed(1)}%) @ ${bp} bp`,
         padL,
         y + 8
       );

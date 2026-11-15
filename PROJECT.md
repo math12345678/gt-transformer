@@ -38,9 +38,9 @@ The system is decomposed into:
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
 | M1 | Statistical Calibration & Recall | F1, F2, F3, F4 (haldec.py, pipeline.py, calibration math) | none | DONE (Gate 1 Iter 3 PASS) |
-| M2 | Standalone Packaging & Portability | F5, F6, F7, F8 (gt_core/, checkpoints/, run_server.sh) | M1 | IN_PROGRESS |
-| M3 | Empirical Validation & Diagnostics | F9, F10, F11 (app.py, fasta_utils.py, schemas.py) | M2 | PLANNED |
-| M4 | Latency, Concurrency & UX | F12, F13, F14, F15 (inference_adapter.py, timing.py, app.js, index.html) | M3 | PLANNED |
+| M2 | Standalone Packaging & Portability | F5, F6, F7, F8 (gt_core/, checkpoints/, run_server.sh) | M1 | DONE (Gate 2 Iter 1 PASS) |
+| M3 | Empirical Validation & Diagnostics | F9, F10, F11 (app.py, fasta_utils.py, schemas.py) | M2 | DONE (Gate 3 Iter 2 PASS) |
+| M4 | Latency, Concurrency & UX | F12, F13, F14, F15 (inference_adapter.py, timing.py, app.js, index.html) | M3 | IN_PROGRESS |
 | M5 | 6-Battery Stress Testing & Playwright E2E | F16, F17, F18 (tests/test_battery_*.py, Playwright E2E, audit) | M4 | PLANNED |
 
 ## Interface Contracts

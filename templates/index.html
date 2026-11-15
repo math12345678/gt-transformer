@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>gt-transformer (RDP5 / OpenRDP Web Interface)</title>
-  <link rel="stylesheet" href="/static/css/styles.css?v=4" />
+  <link rel="stylesheet" href="/static/css/styles.css?v=5" />
 </head>
 <body>
   <!-- Classic RDP5-Style Desktop Toolbar -->
@@ -17,15 +17,24 @@
       <button type="button" id="btnRunTop" class="tb-btn tb-btn-run" title="Run recombination detection">
         Run
       </button>
+      <button type="button" id="btnCancelJobTop" class="tb-btn tb-btn-cancel hidden" title="Cancel active job">
+        Cancel
+      </button>
       <button type="button" id="btnOptionsTop" class="tb-btn" title="Configure model and localiser options (.ini)">
         Options
       </button>
+      <button type="button" id="btnToggleHowToUse" class="tb-btn" title="Show or hide the quick user guide">
+        How to use
+      </button>
       <div class="tb-sep"></div>
+      <button type="button" id="btnExportBpCsv" class="tb-btn" title="Download results table as CSV">
+        Download CSV
+      </button>
+      <button type="button" id="btnExportJson" class="tb-btn" title="Download complete results as JSON">
+        Download JSON
+      </button>
       <button type="button" id="btnExportOpenRdpTsv" class="tb-btn" title="Export OpenRDP-style summary table (TSV)">
         Save OpenRDP TSV
-      </button>
-      <button type="button" id="btnExportBpCsv" class="tb-btn" title="Export consolidated breakpoints CSV">
-        Save Breakpoints CSV
       </button>
       <button type="button" id="btnExportSeqCsv" class="tb-btn" title="Export sequence & parental calls CSV">
         Save Sequence Calls
@@ -33,15 +42,12 @@
       <a href="/api/timings/export.csv" class="tb-btn" title="Download stage-by-stage wall-clock timing CSV">
         Timings CSV
       </a>
-      <button type="button" id="btnExportJson" class="tb-btn" title="Export complete diagnostic JSON">
-        Save JSON
-      </button>
     </div>
 
     <div class="toolbar-dataset">
       <label for="presetSelect" class="tb-lbl">Dataset:</label>
       <select id="presetSelect" class="tb-select"></select>
-      <span id="engineStatusBadge" class="status-box">live · 570,881 params</span>
+      <span id="engineStatusBadge" class="status-box">live · 570,881 params · ready</span>
     </div>
   </header>
 
@@ -54,6 +60,61 @@
     <button type="button" id="btnDismissGlobalError" class="banner-dismiss" title="Dismiss error">&times;</button>
   </div>
 
+  <!-- Live Background Job Progress & Cancel Bar -->
+  <div id="jobStatusBar" class="job-status-bar hidden" role="status" aria-live="polite">
+    <div class="job-status-left">
+      <span id="jobStatusBadge" class="job-badge">Running</span>
+      <span id="jobStageText" class="mono">Stage: parsing</span>
+      <span id="jobElapsedText" class="mono-muted">(0.0 s)</span>
+    </div>
+    <button type="button" id="btnCancelJobBanner" class="tb-btn tb-btn-cancel">Cancel Job</button>
+  </div>
+
+  <!-- Phase 6: Self-Explanatory "How to use" Panel for Dr. Martin -->
+  <section id="howToUsePanel" class="how-to-panel">
+    <div class="how-to-header">
+      <strong>How to Use gt-transformer (RDP5 / OpenRDP Web Interface)</strong>
+      <div class="how-to-actions">
+        <button type="button" id="btnDownloadCsvGuide" class="mini-btn" title="Download current results as CSV">Download Results (CSV)</button>
+        <button type="button" id="btnDownloadJsonGuide" class="mini-btn" title="Download current results as JSON">Download Results (JSON)</button>
+        <button type="button" id="btnCloseHowToUse" class="mini-btn" title="Hide guide">Hide</button>
+      </div>
+    </div>
+    <div class="how-to-grid">
+      <div class="how-to-col">
+        <h4>1. Input Rules</h4>
+        <ul>
+          <li><strong>Aligned FASTA:</strong> 5 to 500 sequences, identical aligned length up to 50,000 bp (max 20 MB upload).</li>
+          <li><strong>Alphabet:</strong> Standard IUPAC nucleotide codes (<code>ACGTUNRYKMSWBDHV-.?</code>) and gaps (<code>-</code>, <code>.</code>). Whitespace, <code>\r</code>, and embedded digits are stripped; sequences are uppercased automatically.</li>
+          <li><strong>Headers:</strong> First word after <code>&gt;</code> is used as the display name; hover any sequence name to see the full header.</li>
+        </ul>
+      </div>
+      <div class="how-to-col">
+        <h4>2. Output Columns</h4>
+        <ul>
+          <li><strong>BP (orig) &amp; Span (orig):</strong> 1-based alignment column of the breakpoint and its confidence interval (<code>start..end</code> bp).</li>
+          <li><strong>Carriers:</strong> Recombinant sequence(s) carrying the mosaic switch (e.g. <code>R1_rec</code>).</li>
+          <li><strong>Ext Parents (L→R):</strong> Flanking parental lineages across the breakpoint (backbone/major vs donor/minor parent). Identical sibling candidates are reported as <code>P1 or P5</code>.</li>
+        </ul>
+      </div>
+      <div class="how-to-col">
+        <h4>3. Modes &amp; Checkpoints</h4>
+        <ul>
+          <li><strong>Hybrid (default):</strong> Combines permutation-calibrated flanking KL scan with 4-row quartet Transformer scoring.</li>
+          <li><strong>Transformer only / Flanking KL only:</strong> Run the neural quartet scorer standalone or the fast analytical KL scan alone.</li>
+          <li><strong>Checkpoints:</strong> <code>ckpt_N10000</code> (default, calibrated on standard viral/bacterial alignments); switch to <code>ckpt_N10000_extreme</code> for high-divergence OOD alignments.</li>
+        </ul>
+      </div>
+      <div class="how-to-col">
+        <h4>4. Known Limits &amp; Run Times</h4>
+        <ul>
+          <li><strong>Limits:</strong> ~30 bp edge dead zone at alignment ends; short tracts (&lt;100 bp) or &lt;10 parsimony-informative sites have reduced power.</li>
+          <li><strong>Typical CPU run times (from <code>timings.csv</code>):</strong> <code>8 × 1,500 bp</code>: ~1.2 s &nbsp;|&nbsp; <code>6 × 1,200 bp</code>: ~2.1 s &nbsp;|&nbsp; <code>60 × 3,000 bp</code>: ~6.4 s &nbsp;|&nbsp; <code>96 × 3,536 bp</code>: ~23.8 s.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
   <!-- Full-Length Alignment & Informative-Site Overview Strip (like RDP5 top magenta track) -->
   <div class="overview-strip-wrap">
     <canvas id="overviewStripCanvas" width="1280" height="28"></canvas>
@@ -64,7 +125,7 @@
     <!-- PANE 1 (TOP-LEFT): Multiple Sequence Alignment Viewer -->
     <section class="rdp-pane pane-alignment">
       <div class="pane-header">
-        <span class="pane-title" id="alnPaneTitle">Sequence Alignment (0..110 bp)</span>
+        <span class="pane-title" id="alnPaneTitle">Sequence Alignment (No active run)</span>
         <div class="aln-nav-controls">
           <button type="button" id="btnAlnPrevFast" class="mini-btn" title="Back 500 bp">&lt;&lt;</button>
           <button type="button" id="btnAlnPrev" class="mini-btn" title="Back 80 bp">&lt;</button>
@@ -79,7 +140,7 @@
 
       <div class="aln-viewer-body">
         <div class="aln-matrix-scroll" id="alnMatrixContainer">
-          <div class="mono-muted" style="padding:12px;">Loading alignment...</div>
+          <div class="mono-muted" style="padding:12px;">Open a FASTA alignment or pick a demo, then press Run.</div>
         </div>
         <div class="aln-seq-sidebar">
           <div class="aln-seq-sidebar-head">
@@ -114,7 +175,8 @@
             <span><strong>Time:</strong> <span id="sumTime">—</span></span>
             <span id="sumWarningsTag" class="sum-warnings-tag hidden" title="Click to view warnings in Diagnostics tab"></span>
           </div>
-          <div class="pane-subhead" id="presetMetaLine"></div>
+          <div class="stage-timing-banner hidden" id="stageTimingSummaryLine"></div>
+          <div class="pane-subhead" id="presetMetaLine">Open a FASTA alignment or pick a demo, then press Run.</div>
           <div class="table-scroll">
             <table class="rdp-table rdp-table-select" id="level1EventsTable">
               <thead>
@@ -131,7 +193,9 @@
                   <th>Status</th>
                 </tr>
               </thead>
-              <tbody id="level1EventsBody"></tbody>
+              <tbody id="level1EventsBody">
+                <tr><td colspan="10" class="mono-muted">Open a FASTA alignment or pick a demo, then press Run.</td></tr>
+              </tbody>
             </table>
           </div>
         </div>
@@ -323,6 +387,7 @@
         <aside class="plot-side-controls">
           <div class="readout-box" id="cursorReadoutBox">0 : 0.00</div>
           <button type="button" id="btnRunSide" class="win-btn win-btn-run">Run</button>
+          <button type="button" id="btnCancelJobSide" class="win-btn tb-btn-cancel hidden">Cancel</button>
 
           <label class="side-lbl" for="scoringModeSelect">Check using</label>
           <select id="scoringModeSelect" class="win-select"></select>
@@ -502,6 +567,6 @@
     </div>
   </div>
 
-  <script src="/static/js/app.js?v=4"></script>
+  <script src="/static/js/app.js?v=5"></script>
 </body>
 </html>

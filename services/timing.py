@@ -114,6 +114,25 @@ class TimingRecorder:
         bp_per_sec = round(self.genome_length_bp / total_sec, 1)
         cols_per_sec = round(self.n_transformed_cols / total_sec, 1)
 
+        by_id = {s.stage_id: s.duration_ms / 1000.0 for s in stages}
+        parse_s = round(by_id.get("parse_filter", 0.0) + by_id.get("binarise_coords", 0.0), 3)
+        tf_s = round(by_id.get("pairwise_embed", 0.0) + by_id.get("transformer_fwd", 0.0), 3)
+        kl_s = round(by_id.get("flank_kl_null", 0.0), 3)
+        render_s = round(by_id.get("consolidate_3level", 0.0), 3)
+        tot_s = round(total_ms / 1000.0, 3)
+
+        stage_seconds = {
+            "parse_s": parse_s,
+            "kl_s": kl_s,
+            "transformer_s": tf_s,
+            "render_s": render_s,
+            "total_s": tot_s,
+        }
+        stage_summary_line = (
+            f"Ran in {tot_s:.2f} s: transformer {tf_s:.2f} s, KL {kl_s:.2f} s, "
+            f"parse {parse_s:.2f} s, render {render_s:.2f} s"
+        )
+
         return InferenceTimingReport(
             run_id=self.run_id,
             timestamp_iso=self.timestamp_iso,
@@ -130,6 +149,8 @@ class TimingRecorder:
             throughput_bp_per_sec=bp_per_sec,
             throughput_cols_per_sec=cols_per_sec,
             stages=stages,
+            stage_summary_line=stage_summary_line,
+            stage_seconds=stage_seconds,
         )
 
 

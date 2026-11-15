@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 class InferenceConfig(BaseModel):
     """Configuration parameters for running a live GT-Transformer inference job."""
     checkpoint: str = Field(
-        default="ckpt_N10000_extreme",
+        default="ckpt_N10000",
         description="Trained model checkpoint identifier.",
     )
     scoring_mode: Literal["hybrid_flank", "standalone_tf", "flank_kl", "global_kl"] = Field(
@@ -100,6 +100,8 @@ class InferenceTimingReport(BaseModel):
     throughput_bp_per_sec: float
     throughput_cols_per_sec: float
     stages: list[StageTiming]
+    stage_summary_line: str = ""
+    stage_seconds: dict[str, float] = Field(default_factory=dict)
 
 
 class ParentalCandidate(BaseModel):
@@ -155,6 +157,14 @@ class ConsolidatedEvent(BaseModel):
     matched_gt_event_id: Optional[int | str] = None
     bp_error: Optional[int] = None
     diagnostic_explanation: str = ""
+
+    @property
+    def start_bp(self) -> int:
+        return self.span_orig_start
+
+    @property
+    def end_bp(self) -> int:
+        return self.span_orig_end
 
 
 class RawPeakCall(BaseModel):
@@ -234,9 +244,15 @@ class AlignmentMetadata(BaseModel):
     window_size: int
     null_policy: str
     sequence_names: list[str]
+    full_headers: dict[str, str] = Field(default_factory=dict)
+    edge_dead_zone_bp: int = 30
     gc_content_pct: float
     ambiguity_pct: float
     is_rna: bool = False
+
+    @property
+    def length(self) -> int:
+        return self.genome_length_bp
 
 
 class InferenceResponse(BaseModel):
