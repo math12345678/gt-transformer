@@ -1,4 +1,4 @@
-app = "openrdp-recomb"
+app = "gt-transformer-web"
 primary_region = "jnb"
 
 [build]
