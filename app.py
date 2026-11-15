@@ -154,7 +154,7 @@ async def index() -> FileResponse:
     index_file = TEMPLATES_DIR / "index.html"
     if not index_file.exists():
         raise HTTPException(status_code=500, detail="Frontend template index.html not found.")
-    return FileResponse(str(index_file))
+    return FileResponse(str(index_file), headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.get("/healthz")

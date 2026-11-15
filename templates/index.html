@@ -4,10 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>gt-transformer — Recombination Detection Interface</title>
-  <link rel="stylesheet" href="/static/css/styles.css?v=5" />
+  <link rel="stylesheet" href="/static/css/styles.css?v=6" />
 </head>
 <body>
-  <!-- Classic RDP5-Style Desktop Toolbar -->
+  <!-- Desktop Toolbar -->
   <header class="rdp-toolbar app-toolbar">
     <div class="toolbar-buttons">
       <button type="button" id="btnOpenFasta" class="tb-btn" title="Upload or paste FASTA alignment & ground truth">
@@ -115,12 +115,12 @@
     </div>
   </section>
 
-  <!-- Full-Length Alignment & Informative-Site Overview Strip (like RDP5 top magenta track) -->
+  <!-- Full-Length Alignment & Informative-Site Overview Strip -->
   <div class="overview-strip-wrap">
     <canvas id="overviewStripCanvas" width="1280" height="28"></canvas>
   </div>
 
-  <!-- Classic RDP5 2x2 Desktop Split Workspace -->
+  <!-- 2x2 Desktop Split Workspace -->
   <main class="rdp-grid">
     <!-- PANE 1 (TOP-LEFT): Multiple Sequence Alignment Viewer -->
     <section class="rdp-pane pane-alignment">
@@ -163,7 +163,7 @@
       </div>
 
       <div class="pane-tab-body">
-        <!-- TAB: Overview (OpenRDP + RDP5 Event Summary Table + Run Summary Strip) -->
+        <!-- TAB: Overview (Event Summary Table + Run Summary Strip) -->
         <div id="tab-overview" class="tab-content">
           <div class="summary-bar" id="runSummaryBar">
             <span><strong>Align:</strong> <span id="sumDimensions">—</span></span>
@@ -376,7 +376,7 @@
       </div>
     </section>
 
-    <!-- PANE 3 (BOTTOM-LEFT): RDP5 Breakpoint / Boundary Scan Plot + Side Controls -->
+    <!-- PANE 3 (BOTTOM-LEFT): Breakpoint / Boundary Scan Plot + Side Controls -->
     <section class="rdp-pane pane-plot">
       <div class="plot-split">
         <div class="plot-canvas-box">
@@ -410,7 +410,7 @@
       </div>
     </section>
 
-    <!-- PANE 4 (BOTTOM-RIGHT): RDP5 Mosaic Sequence Map (Parental Tract Bars) -->
+    <!-- PANE 4 (BOTTOM-RIGHT): Mosaic Sequence Map (Parental Tract Bars) -->
     <section class="rdp-pane pane-mosaic">
       <div class="pane-header">
         <span class="pane-title">Recombinant Sequence Mosaic Map (Inferred Parental Tracts)</span>
@@ -474,7 +474,7 @@
     </div>
   </div>
 
-  <!-- MODAL 2: Options Dialog (RDP5 / OpenRDP .ini Parameters) -->
+  <!-- MODAL 2: Options Dialog (.ini Parameters) -->
   <div id="optionsModal" class="modal-overlay hidden">
     <div class="modal-box">
       <div class="modal-head">
@@ -567,6 +567,6 @@
     </div>
   </div>
 
-  <script src="/static/js/app.js?v=5"></script>
+  <script src="/static/js/app.js?v=6"></script>
 </body>
 </html>
