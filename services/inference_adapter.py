@@ -18,7 +18,10 @@ import json
 import os
 import pickle
 import sys
+import threading
+import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
@@ -90,44 +93,74 @@ from services.timing import TimingHistoryStore, TimingRecorder  # noqa: E402
 # Checkpoint Metadata & Multi-Discovery
 # ---------------------------------------------------------------------------
 KNOWN_CHECKPOINT_METADATA: dict[str, dict[str, Any]] = {
-    "ckpt_N10000": {
-        "label": "ckpt_N10000 — 10k In-Range Standard Model (Recommended Default)",
+    "ckpt_N40000": {
+        "label": "ckpt_N40000: 40k Corpus Standard Model (Recommended Default)",
         "description": (
-            "Default checkpoint trained on 7,000 in-range SantaSim alignments (10,000 corpus; "
-            "val AUPRC 0.572, test AUPRC 0.366). Best calibrated for standard viral alignments."
+            "Default checkpoint trained for 20 epochs on the 40,000-alignment SantaSim corpus "
+            "(28,000 train / 6,000 val / 6,000 test). Evaluated separately at dataset, breakpoint, "
+            "carrier, and co-descendant levels."
+        ),
+        "recommended": True,
+    },
+    "ckpt_N10000": {
+        "label": "ckpt_N10000: 10k Corpus Standard Model",
+        "description": (
+            "Standard 10k checkpoint trained on 7,000 in-range SantaSim alignments (10,000 corpus)."
         ),
         "recommended": True,
     },
     "ckpt_N10000_extreme": {
-        "label": "ckpt_N10000_extreme — Multi-Rate Extreme Regime (0.2x–5.0x Rates)",
+        "label": "ckpt_N10000_extreme: Multi-Rate Extreme Regime (0.2x-5.0x Rates)",
         "description": (
             "Trained jointly on 7,000 in-range alignments and extreme mutation/recombination "
-            "arms (0.2x–5.0x rates). Use for hyper-divergent or ultra-conserved alignments."
+            "arms (0.2x-5.0x rates). Use for hyper-divergent or ultra-conserved alignments."
         ),
         "recommended": True,
     },
+    "ckpt_N10000_v2": {
+        "label": "ckpt_N10000_v2: V2 LD-Invariant Multi-Rate Model",
+        "description": (
+            "Warm-started V2 architecture (arch_version=2) with explicit linkage invariants "
+            "(|D'|, r², 4-gamete flag, NMI), Conv1D stem, and multi-scale L/R contrast head."
+        ),
+        "recommended": True,
+    },
+    "ckpt_ensemble": {
+        "label": "ckpt_ensemble: Multi-Model LogMeanExp Ensemble",
+        "description": (
+            "Virtual ensemble combining boundary logits via LogMeanExp across the strongest standard "
+            "backbone (ckpt_N40000 or ckpt_N10000), ckpt_N10000_extreme, and converged ckpt_N10000_v2."
+        ),
+        "recommended": True,
+        "is_virtual": True,
+    },
     "ckpt_N8000": {
-        "label": "ckpt_N8000 — 8k Scaling Checkpoint (val AUPRC 0.539)",
+        "label": "ckpt_N8000: 8k Scaling Checkpoint",
         "description": "Trained on 5,600 in-range alignments from the 8k scaling tier.",
         "recommended": False,
     },
     "ckpt_N4000": {
-        "label": "ckpt_N4000 — 4k Scaling Checkpoint (val AUPRC 0.362)",
+        "label": "ckpt_N4000: 4k Scaling Checkpoint",
         "description": "Intermediate scaling checkpoint trained on 2,800 alignments.",
         "recommended": False,
     },
     "ckpt_N2000": {
-        "label": "ckpt_N2000 — 2k Scaling Checkpoint (val AUPRC 0.195)",
+        "label": "ckpt_N2000: 2k Scaling Checkpoint",
         "description": "Early scaling checkpoint trained on 1,400 alignments.",
         "recommended": False,
     },
     "ckpt_N1000": {
-        "label": "ckpt_N1000 — 1k Scaling Checkpoint (val AUPRC 0.101)",
+        "label": "ckpt_N1000: 1k Scaling Checkpoint",
         "description": "1,000-alignment baseline scaling tier (700 training alignments).",
         "recommended": False,
     },
+    "ckpt_user_adaptive": {
+        "label": "ckpt_user_adaptive: Adaptive (User-Trained)",
+        "description": "Continuously fine-tuned on user-submitted alignments only.",
+        "recommended": False,
+    },
     "ckpt_4x_panel": {
-        "label": "ckpt_4x_panel — 50-Dataset Panel (4x Augmented Regime)",
+        "label": "ckpt_4x_panel: 50-Dataset Panel (4x Augmented Regime)",
         "description": "Original 2,000-step Window Transformer trained on the 35-alignment panel.",
         "recommended": False,
     },
@@ -225,7 +258,61 @@ def discover_available_checkpoints() -> dict[str, dict[str, Any]]:
                             "source": "parent",
                         }
 
-    return ckpts
+    ens_members = resolve_ensemble_member_ids(ckpts)
+    if len(ens_members) >= 2:
+        meta_e = KNOWN_CHECKPOINT_METADATA["ckpt_ensemble"]
+        ckpts["ckpt_ensemble"] = {
+            "id": "ckpt_ensemble",
+            "path": ckpts[ens_members[0]]["path"],
+            "label": f"ckpt_ensemble: Multi-Model LogMeanExp Ensemble ({' + '.join(ens_members)})",
+            "description": meta_e["description"],
+            "recommended": meta_e.get("recommended", True),
+            "source": "virtual",
+            "is_virtual": True,
+            "members": ens_members,
+        }
+
+    preferred_order = [
+        "ckpt_N40000",
+        "ckpt_ensemble",
+        "ckpt_N10000_extreme",
+        "ckpt_N10000_v2",
+        "ckpt_N10000",
+    ]
+    ordered: dict[str, dict[str, Any]] = {}
+    for cid in preferred_order:
+        if cid in ckpts:
+            ordered[cid] = ckpts[cid]
+    for cid, entry in ckpts.items():
+        if cid not in ordered:
+            ordered[cid] = entry
+    return ordered
+
+
+def resolve_ensemble_member_ids(registry: dict[str, dict[str, Any]]) -> list[str]:
+    """Select the strongest available non-redundant ensemble members from discovered checkpoints."""
+    members: list[str] = []
+    std_id = (
+        "ckpt_N40000"
+        if ("ckpt_N40000" in registry and Path(registry["ckpt_N40000"]["path"]).is_file())
+        else "ckpt_N10000"
+    )
+    if std_id in registry and Path(registry[std_id]["path"]).is_file():
+        members.append(std_id)
+    if "ckpt_N10000_extreme" in registry and Path(registry["ckpt_N10000_extreme"]["path"]).is_file():
+        members.append("ckpt_N10000_extreme")
+    if "ckpt_N10000_v2" in registry and Path(registry["ckpt_N10000_v2"]["path"]).is_file():
+        try:
+            v2_path = Path(registry["ckpt_N10000_v2"]["path"])
+            with open(v2_path, "rb") as fh:
+                v2_pl = pickle.load(fh)
+            v2_cfg = M.config_from_dict(v2_pl.get("cfg", {}))
+            v2_score = float(v2_pl.get("val_auprc") or 0.0)
+            if int(getattr(v2_cfg, "arch_version", 1)) == 2 and v2_score >= 0.08:
+                members.append("ckpt_N10000_v2")
+        except Exception:
+            pass
+    return members
 
 
 CHECKPOINT_REGISTRY: dict[str, dict[str, Any]] = discover_available_checkpoints()
@@ -422,6 +509,55 @@ class BaseInferenceEngine(ABC):
         """Execute inference and return real timings + 3-level report + diagnostics."""
 
 
+def _parse_parent_tokens(label: str) -> set[str]:
+    """Extract normalized parental taxon names from a possibly tie-annotated label."""
+    tokens: set[str] = set()
+    for part in str(label or "").split(" or "):
+        for sub in part.split("/"):
+            tok = sub.strip()
+            if tok and tok != "?":
+                tokens.add(tok)
+    return tokens
+
+
+def assign_ancestral_event_ids(events: list[ConsolidatedEvent], max_bp_gap: int = 150) -> None:
+    """Group co-descendant events sharing breakpoint locality and parental donors under 1-based `ancestral_event_id`."""
+    n = len(events)
+    if n == 0:
+        return
+
+    def _share_origin(a: ConsolidatedEvent, b: ConsolidatedEvent) -> bool:
+        if abs(int(a.most_plausible_bp_orig) - int(b.most_plausible_bp_orig)) > max_bp_gap:
+            return False
+        if not a.recombinants or not b.recombinants:
+            return False
+        ra, rb = a.recombinants[0], b.recombinants[0]
+        la = _parse_parent_tokens(ra.ext_parent_left_name)
+        lb = _parse_parent_tokens(rb.ext_parent_left_name)
+        ra_p = _parse_parent_tokens(ra.ext_parent_right_name)
+        rb_p = _parse_parent_tokens(rb.ext_parent_right_name)
+        return bool(la & lb) and bool(ra_p & rb_p)
+
+    visited = [False] * n
+    next_gid = 1
+    for i in range(n):
+        if visited[i]:
+            continue
+        stack = [i]
+        comp: list[int] = []
+        visited[i] = True
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in range(n):
+                if not visited[v] and _share_origin(events[u], events[v]):
+                    visited[v] = True
+                    stack.append(v)
+        for idx in comp:
+            events[idx].ancestral_event_id = next_gid
+        next_gid += 1
+
+
 class GTTransformerInferenceEngine(BaseInferenceEngine):
     """Live GT-Transformer inference engine wired directly to model & pipeline infrastructure."""
 
@@ -433,16 +569,67 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         self._score_fn_cache: dict[M.Config, Any] = {}
         self._warmed_configs: set[M.Config] = set()
         self._preset_meta_cache: Optional[list[dict[str, Any]]] = None
+        self._alignment_cache_lock = threading.Lock()
         self._alignment_cache: dict[str, dict[str, Any]] = {}
         self._alignment_cache_order: list[str] = []
         self.is_warmed_up: bool = False
         self.startup_load_ms: float = 0.0
 
+    def _store_alignment_cache(
+        self,
+        run_id: str,
+        names: list[str],
+        seqs: list[str],
+        kept: list[int] | np.ndarray,
+        L: int,
+    ) -> None:
+        with self._alignment_cache_lock:
+            self._alignment_cache[run_id] = {
+                "names": list(names),
+                "seqs": list(seqs),
+                "kept_set": set(int(c) for c in kept),
+                "L": int(L),
+            }
+            if run_id in self._alignment_cache_order:
+                self._alignment_cache_order.remove(run_id)
+            self._alignment_cache_order.append(run_id)
+            while len(self._alignment_cache_order) > 16:
+                old_id = self._alignment_cache_order.pop(0)
+                self._alignment_cache.pop(old_id, None)
+
+    def hydrate_alignment_cache(
+        self, run_id: str, fasta_text: str, null_policy: str = "duplicate"
+    ) -> bool:
+        """Populate the in-memory alignment viewer cache from saved FASTA text or a preset reference."""
+        stripped = (fasta_text or "").strip()
+        if not stripped:
+            return False
+        actual_fasta = stripped
+        if stripped.startswith("# preset:"):
+            preset_id = stripped.split(":", 1)[1].strip()
+            preset_meta = PRESET_REGISTRY.get(preset_id)
+            if not preset_meta:
+                return False
+            fasta_path = Path(preset_meta["fasta_path"])
+            if not fasta_path.exists():
+                return False
+            actual_fasta = fasta_path.read_text(encoding="utf-8", errors="ignore")
+        try:
+            names, seqs, _, _ = parse_and_validate_fasta(actual_fasta, strict_phase2=False)
+            if not seqs or not seqs[0]:
+                return False
+            kept, _, _, _ = self._select_informative_and_binarise(seqs, null_policy)
+        except Exception:
+            return False
+        self._store_alignment_cache(run_id, names, seqs, kept, len(seqs[0]))
+        return True
+
     def get_alignment_window(
         self, run_id: str, start_bp: int = 0, width: int = 120
     ) -> dict[str, Any]:
-        """Return actual nucleotide alignment slice & informative site coordinates for the RDP5 viewer."""
-        entry = self._alignment_cache.get(run_id)
+        """Return actual nucleotide alignment slice & informative site coordinates for the sequence viewer."""
+        with self._alignment_cache_lock:
+            entry = self._alignment_cache.get(run_id)
         if entry is None:
             raise ValueError(f"Alignment session '{run_id}' not found or expired; re-run inference.")
         L = int(entry["L"])
@@ -474,6 +661,216 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             "sequences": seq_rows,
         }
 
+    @staticmethod
+    def _seqs_to_ascii_array(seqs: list[str]) -> tuple[np.ndarray, np.ndarray]:
+        arr = np.vstack(
+            [
+                np.frombuffer(
+                    seq.upper().replace("U", "T").encode("ascii", errors="replace"),
+                    dtype=np.uint8,
+                )
+                for seq in seqs
+            ]
+        )
+        valid = (arr == 65) | (arr == 67) | (arr == 71) | (arr == 84)
+        return arr, valid
+
+    def get_region_stats(
+        self,
+        run_id: str,
+        start_bp: int,
+        end_bp: int,
+        ref_seq_idx: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Compute nucleotide diversity, GC/gap stats, and pairwise inside-vs-outside identity for a selected region."""
+        with self._alignment_cache_lock:
+            entry = self._alignment_cache.get(run_id)
+        if entry is None:
+            raise ValueError(f"Alignment session '{run_id}' not found or expired; re-run inference.")
+
+        L = int(entry["L"])
+        names: list[str] = entry["names"]
+        seqs: list[str] = entry["seqs"]
+        kept_set: set[int] = entry["kept_set"]
+        S = len(seqs)
+
+        start_1 = max(1, min(L, int(start_bp)))
+        end_1 = max(start_1, min(L, int(end_bp)))
+        s0 = start_1 - 1
+        e0 = end_1
+        reg_len = e0 - s0
+        info_sites = sum(1 for c in range(s0, e0) if c in kept_set)
+
+        arr, valid_all = self._seqs_to_ascii_array(seqs)
+        reg = arr[:, s0:e0]
+        valid_reg = valid_all[:, s0:e0]
+
+        gc_cnt = int(np.sum((reg == 71) | (reg == 67)))
+        acgt_cnt = int(np.sum(valid_reg))
+        gc_pct = round((gc_cnt / acgt_cnt) * 100.0, 2) if acgt_cnt > 0 else 0.0
+        gap_pct = round((1.0 - (acgt_cnt / max(1, reg.size))) * 100.0, 2)
+
+        sub_idx = np.linspace(0, S - 1, min(S, 40), dtype=int) if S > 40 else np.arange(S)
+        reg_sub = reg[sub_idx]
+        v_sub = valid_reg[sub_idx]
+        diffs_sum = 0.0
+        pair_cnt = 0
+        for i_idx in range(len(sub_idx)):
+            for j_idx in range(i_idx + 1, len(sub_idx)):
+                both = v_sub[i_idx] & v_sub[j_idx]
+                nb = int(np.sum(both))
+                if nb > 0:
+                    diffs_sum += float(np.sum(reg_sub[i_idx, both] != reg_sub[j_idx, both])) / nb
+                    pair_cnt += 1
+        pi_div = round(diffs_sum / pair_cnt, 5) if pair_cnt > 0 else 0.0
+
+        ref_idx = max(0, min(S - 1, int(ref_seq_idx or 0)))
+        both_in = valid_reg & valid_reg[ref_idx : ref_idx + 1, :]
+        match_in = both_in & (reg == reg[ref_idx : ref_idx + 1, :])
+        cnt_both_in = np.sum(both_in, axis=1)
+        cnt_match_in = np.sum(match_in, axis=1)
+
+        out_mask = np.ones(L, dtype=bool)
+        out_mask[s0:e0] = False
+        has_outside = bool(np.any(out_mask))
+        if has_outside:
+            arr_out = arr[:, out_mask]
+            valid_out = valid_all[:, out_mask]
+            both_out = valid_out & valid_out[ref_idx : ref_idx + 1, :]
+            match_out = both_out & (arr_out == arr_out[ref_idx : ref_idx + 1, :])
+            cnt_both_out = np.sum(both_out, axis=1)
+            cnt_match_out = np.sum(match_out, axis=1)
+        else:
+            cnt_both_out = np.zeros(S, dtype=np.int64)
+            cnt_match_out = np.zeros(S, dtype=np.int64)
+
+        pairwise: list[dict[str, Any]] = []
+        for j in range(S):
+            if j == ref_idx:
+                continue
+            n_in = int(cnt_both_in[j])
+            in_pct = round(float(cnt_match_in[j]) / n_in * 100.0, 2) if n_in > 0 else None
+            n_out = int(cnt_both_out[j])
+            out_pct = round(float(cnt_match_out[j]) / n_out * 100.0, 2) if n_out > 0 else None
+            delta_pct = (
+                round(in_pct - out_pct, 2)
+                if (in_pct is not None and out_pct is not None)
+                else None
+            )
+            pairwise.append(
+                {
+                    "seq_idx": j,
+                    "seq_name": names[j],
+                    "inside_pct": in_pct,
+                    "outside_pct": out_pct,
+                    "delta_pct": delta_pct,
+                    "compared_in": n_in,
+                    "compared_out": n_out,
+                }
+            )
+        pairwise.sort(key=lambda r: (r["inside_pct"] is not None, r["inside_pct"] or -1.0), reverse=True)
+
+        return {
+            "run_id": run_id,
+            "start_bp": start_1,
+            "end_bp": end_1,
+            "length_bp": reg_len,
+            "genome_length_bp": L,
+            "informative_sites": info_sites,
+            "gc_pct": gc_pct,
+            "gap_pct": gap_pct,
+            "nucleotide_diversity_pi": pi_div,
+            "ref_seq_idx": ref_idx,
+            "ref_seq_name": names[ref_idx],
+            "sequences": [{"seq_idx": i, "name": names[i]} for i in range(S)],
+            "pairwise": pairwise,
+        }
+
+    def get_simplot_profile(
+        self,
+        run_id: str,
+        query_seq_idx: int = 0,
+        window_bp: int = 100,
+        step_bp: int = 20,
+        max_refs: int = 8,
+        priority_seq_idxs: Optional[list[int]] = None,
+    ) -> dict[str, Any]:
+        """Compute vectorized sliding-window pairwise identity curves against candidate parental sequences."""
+        with self._alignment_cache_lock:
+            entry = self._alignment_cache.get(run_id)
+        if entry is None:
+            raise ValueError(f"Alignment session '{run_id}' not found or expired; re-run inference.")
+
+        L = int(entry["L"])
+        names: list[str] = entry["names"]
+        seqs: list[str] = entry["seqs"]
+        S = len(seqs)
+
+        arr, valid = self._seqs_to_ascii_array(seqs)
+        q_idx = max(0, min(S - 1, int(query_seq_idx)))
+        win = max(20, min(L, int(window_bp)))
+        step = max(1, min(win, int(step_bp)))
+        k_refs = max(1, min(16, int(max_refs)))
+
+        both = valid & valid[q_idx : q_idx + 1, :]
+        match = both & (arr == arr[q_idx : q_idx + 1, :])
+        cs_both = np.concatenate([np.zeros((S, 1), dtype=np.int32), np.cumsum(both, axis=1, dtype=np.int32)], axis=1)
+        cs_match = np.concatenate([np.zeros((S, 1), dtype=np.int32), np.cumsum(match, axis=1, dtype=np.int32)], axis=1)
+
+        max_start = max(0, L - win)
+        starts_list = list(range(0, max_start + 1, step))
+        if not starts_list or starts_list[-1] != max_start:
+            starts_list.append(max_start)
+        starts = np.asarray(starts_list, dtype=np.int32)
+        ends = np.minimum(L, starts + win)
+        centers_1based = ((starts + ends) // 2 + 1).tolist()
+
+        denom = cs_both[:, ends] - cs_both[:, starts]
+        numer = cs_match[:, ends] - cs_match[:, starts]
+        ident_pct = np.where(denom > 0, (numer / np.maximum(denom, 1)) * 100.0, np.nan)
+
+        chosen: list[int] = []
+        seen: set[int] = {q_idx}
+        for p in priority_seq_idxs or []:
+            if 0 <= p < S and p not in seen and len(chosen) < k_refs:
+                seen.add(p)
+                chosen.append(p)
+
+        remaining: list[tuple[float, int]] = []
+        for j in range(S):
+            if j in seen:
+                continue
+            vals = ident_pct[j]
+            finite = vals[np.isfinite(vals)]
+            score = float(np.std(finite) + 0.25 * np.mean(finite)) if len(finite) > 0 else -1.0
+            remaining.append((score, j))
+        remaining.sort(key=lambda x: x[0], reverse=True)
+        for _, j in remaining:
+            if len(chosen) >= k_refs:
+                break
+            chosen.append(j)
+
+        series = [
+            {
+                "seq_idx": j,
+                "seq_name": names[j],
+                "identity_pct": [round(float(v), 2) if np.isfinite(v) else None for v in ident_pct[j]],
+            }
+            for j in chosen
+        ]
+
+        return {
+            "run_id": run_id,
+            "genome_length_bp": L,
+            "window_bp": win,
+            "step_bp": step,
+            "query_seq_idx": q_idx,
+            "query_seq_name": names[q_idx],
+            "positions_bp": centers_1based,
+            "sequences": [{"seq_idx": i, "name": names[i]} for i in range(S)],
+            "series": series,
+        }
+
     def _discover_checkpoints(self) -> dict[str, dict[str, Any]]:
         return discover_available_checkpoints()
 
@@ -483,17 +880,37 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         for ckpt_id, meta in registry.items():
             p = Path(meta["path"])
             if p.exists():
-                out.append(
-                    {
-                        "id": ckpt_id,
-                        "label": meta["label"],
-                        "description": meta["description"],
-                        "recommended": meta["recommended"],
-                        "path": str(p),
-                        "source": meta.get("source", "local"),
-                    }
-                )
-        out.sort(key=lambda x: (not x["recommended"], x["id"]))
+                label = meta["label"]
+                updates: Optional[int] = None
+                if ckpt_id == "ckpt_user_adaptive":
+                    try:
+                        with open(p, "rb") as fh:
+                            payload = pickle.load(fh)
+                        updates = int((payload.get("meta") or {}).get("updates", 0))
+                        if updates > 0:
+                            suffix = "s" if updates != 1 else ""
+                            label = f"ckpt_user_adaptive: Adaptive (User-Trained, {updates} update{suffix})"
+                    except Exception:
+                        updates = None
+                item: dict[str, Any] = {
+                    "id": ckpt_id,
+                    "label": label,
+                    "description": meta["description"],
+                    "recommended": meta["recommended"],
+                    "path": str(p),
+                    "source": meta.get("source", "local"),
+                }
+                if updates is not None:
+                    item["updates"] = updates
+                out.append(item)
+        rank_map = {
+            "ckpt_N40000": 0,
+            "ckpt_ensemble": 1,
+            "ckpt_N10000_extreme": 2,
+            "ckpt_N10000_v2": 3,
+            "ckpt_N10000": 4,
+        }
+        out.sort(key=lambda x: (rank_map.get(x["id"], 99), not x["recommended"], x["id"]))
         return out
 
     def list_presets(self) -> list[dict[str, Any]]:
@@ -543,17 +960,26 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         self._preset_meta_cache = out
         return out
 
+    def _resolve_ensemble_members(self) -> list[str]:
+        return resolve_ensemble_member_ids(self._discover_checkpoints())
+
     def warmup(self, checkpoint_id: str = "ckpt_N10000") -> None:
-        """Load checkpoints (ckpt_N10000 and ckpt_N10000_extreme) once and pre-compile static-shape JAX score function."""
+        """Load core checkpoints once and pre-compile static-shape JAX score functions."""
         import time
         t0 = time.perf_counter()
         registry = self._discover_checkpoints()
         target_ids = []
-        for cid in (checkpoint_id, "ckpt_N10000", "ckpt_N10000_extreme"):
-            if cid not in target_ids and cid in registry and Path(registry[cid]["path"]).exists():
+        req_ids = self._resolve_ensemble_members() if checkpoint_id == "ckpt_ensemble" else [checkpoint_id]
+        for cid in (*req_ids, "ckpt_N40000", "ckpt_N10000", "ckpt_N10000_extreme"):
+            if (
+                cid not in target_ids
+                and cid in registry
+                and not registry[cid].get("is_virtual")
+                and Path(registry[cid]["path"]).exists()
+            ):
                 target_ids.append(cid)
         if not target_ids:
-            avail = self.list_checkpoints()
+            avail = [c for c in self.list_checkpoints() if c["id"] != "ckpt_ensemble"]
             if not avail:
                 return
             target_ids = [avail[0]["id"]]
@@ -574,11 +1000,20 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         if not ckpt_path.exists():
             raise ValueError(f"Checkpoint file not found on disk: {ckpt_path}")
 
-        with open(ckpt_path, "rb") as fh:
-            payload = pickle.load(fh)
+        payload = None
+        for attempt in range(2):
+            try:
+                with open(ckpt_path, "rb") as fh:
+                    payload = pickle.load(fh)
+                break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                raise
         params = payload["params"]
         cfg_dict = payload.get("cfg", {})
-        cfg = M.Config(**cfg_dict) if cfg_dict else M.Config()
+        cfg = M.config_from_dict(cfg_dict)
         n_params = int(M.n_params(params))
         self._ckpt_cache[checkpoint_id] = (params, cfg, n_params)
         return params, cfg, n_params
@@ -708,13 +1143,14 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
 
     @staticmethod
     def _build_circular_windows_freq(haplo: np.ndarray, window_size: int) -> np.ndarray:
-        """Compute (M_tx, window_size, 4) normalized gamete frequency windows.
+        """Compute (M_tx, window_size, 4) normalized gamete frequency windows using bitwise counts.
 
         When M_tx < window_size, applies linear zero-padding to out-of-range
         offsets to avoid periodic circular wraparound boundary distortion.
         """
         M_tx, S = haplo.shape
-        B = haplo.T.astype(np.int8)  # (S, M_tx)
+        B = haplo.T.astype(np.uint8)  # (S, M_tx) in {0, 1}
+        ones = B.sum(axis=0, dtype=np.int32)
         offs = P._offsets(window_size)
         idx = np.arange(M_tx)
         X = np.zeros((M_tx, len(offs), 4), dtype=np.float32)
@@ -727,19 +1163,77 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 valid = (j >= 0) & (j < M_tx)
                 if not np.any(valid):
                     continue
-                valid_idx = idx[valid]
-                valid_j = j[valid]
-                code = (B[:, valid_idx] << 1) | B[:, valid_j]
-                for g in range(4):
-                    X[valid, pos, g] = (code == g).sum(axis=0, dtype=np.float32) * inv_s
+                vi = idx[valid]
+                vj = j[valid]
+                c11 = np.count_nonzero(B[:, vi] & B[:, vj], axis=0).astype(np.int32)
+                oi = ones[vi]
+                oj = ones[vj]
+                c10 = oi - c11
+                c01 = oj - c11
+                c00 = S - oi - oj + c11
+                X[valid, pos, 0] = c00.astype(np.float32) * inv_s
+                X[valid, pos, 1] = c01.astype(np.float32) * inv_s
+                X[valid, pos, 2] = c10.astype(np.float32) * inv_s
+                X[valid, pos, 3] = c11.astype(np.float32) * inv_s
         else:
             # Standard circular moving window for full-length alignments
             for pos, d in enumerate(offs):
                 j = (idx + d) % M_tx
-                code = (B[:, idx] << 1) | B[:, j]  # (S, M_tx) in 0..3
-                for g in range(4):
-                    X[:, pos, g] = (code == g).sum(axis=0, dtype=np.float32) * inv_s
+                c11 = np.count_nonzero(B & B[:, j], axis=0).astype(np.int32)
+                oj = ones[j]
+                c10 = ones - c11
+                c01 = oj - c11
+                c00 = S - ones - oj + c11
+                X[:, pos, 0] = c00.astype(np.float32) * inv_s
+                X[:, pos, 1] = c01.astype(np.float32) * inv_s
+                X[:, pos, 2] = c10.astype(np.float32) * inv_s
+                X[:, pos, 3] = c11.astype(np.float32) * inv_s
         return X
+
+    @staticmethod
+    def _fuse_ensemble_logits(member_logits: list[np.ndarray]) -> np.ndarray:
+        """Smooth noisy-OR LogMeanExp fusion preserving confident specialist calls."""
+        if len(member_logits) == 1:
+            return np.asarray(member_logits[0], dtype=np.float64)
+        stack = np.stack([np.asarray(m, dtype=np.float64) for m in member_logits], axis=0)
+        m_max = np.max(stack, axis=0)
+        return m_max + np.log(np.mean(np.exp(stack - m_max), axis=0))
+
+    @staticmethod
+    def _align_reverse_logits(sc_fwd: np.ndarray, sc_rev: np.ndarray, win_size: int) -> np.ndarray:
+        """Map reverse-complemented column logits back to forward boundary indices `0..M_tx-1`."""
+        M_tx = len(sc_fwd)
+        if M_tx >= win_size:
+            return sc_rev[(M_tx - np.arange(M_tx)) % M_tx]
+        aligned = np.empty_like(sc_rev)
+        aligned[0] = sc_fwd[0]
+        if M_tx > 1:
+            aligned[1:] = sc_rev[M_tx - np.arange(1, M_tx)]
+        return aligned
+
+    def _score_transformer_with_tta(
+        self,
+        params: Any,
+        cfg: M.Config,
+        score_fn: Any,
+        haplo: np.ndarray,
+        x_fwd: np.ndarray,
+        x_rev_cache: dict[int, np.ndarray],
+        use_mirror_tta: bool,
+        progress_cb: Optional[Any] = None,
+        cancel_check: Optional[Any] = None,
+    ) -> np.ndarray:
+        sc_fwd = self._score_transformer_static(
+            params, cfg, score_fn, x_fwd, progress_cb=progress_cb, cancel_check=cancel_check
+        )
+        if not use_mirror_tta:
+            return sc_fwd
+        if cfg.W not in x_rev_cache:
+            x_rev_cache[cfg.W] = self._build_circular_windows_freq(haplo[::-1].copy(), cfg.W)
+        sc_rev = self._score_transformer_static(
+            params, cfg, score_fn, x_rev_cache[cfg.W], progress_cb=progress_cb, cancel_check=cancel_check
+        )
+        return 0.5 * (sc_fwd + self._align_reverse_logits(sc_fwd, sc_rev, cfg.W))
 
     def _score_transformer_static(
         self,
@@ -789,9 +1283,24 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         if cancel_check is not None and cancel_check():
             raise InterruptedError("Job cancelled by user")
 
-        # Load checkpoint upfront (cached after first load)
-        params, cfg, n_model_params = self._load_checkpoint(config.checkpoint)
-        score_fn = self._get_score_fn(params, cfg)
+        # Load checkpoint or multi-model ensemble upfront (cached after first load)
+        if config.checkpoint == "ckpt_ensemble":
+            member_ids = self._resolve_ensemble_members()
+            if not member_ids:
+                raise ValueError("No member checkpoints available for 'ckpt_ensemble'.")
+            member_models = [(mid, *self._load_checkpoint(mid)) for mid in member_ids]
+            member_fns = [self._get_score_fn(p_m, c_m) for _, p_m, c_m, _ in member_models]
+            cfg = member_models[0][2]
+            n_model_params = sum(np_m for _, _, _, np_m in member_models)
+            model_desc = f"Ensemble of {len(member_models)} models ({'+'.join(member_ids)})"
+        else:
+            params, cfg, n_model_params = self._load_checkpoint(config.checkpoint)
+            score_fn = self._get_score_fn(params, cfg)
+            member_models = [(config.checkpoint, params, cfg, n_model_params)]
+            member_fns = [score_fn]
+            model_desc = f"{config.checkpoint} ({n_model_params:,} params, d={cfg.d_model}, {cfg.n_layers} layers)"
+        if config.use_mirror_tta:
+            model_desc += " + Mirror TTA"
 
         # Resolve alignment input (uploaded FASTA vs preset FASTA file)
         is_known_control = False
@@ -853,6 +1362,7 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             raise InsufficientInformativeSitesError(found=M_tx, required=10)
         haplo = np.array([[1 if v == "1" else 0 for v in col] for col in cols], dtype=np.uint8)
         t_s2_ms = (time.perf_counter() - t_s2_start) * 1000.0
+        t_after_s2 = time.perf_counter()
 
         recorder = TimingRecorder(
             dataset_name=ds_name,
@@ -911,50 +1421,7 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         if cancel_check is not None and cancel_check():
             raise InterruptedError("Job cancelled by user")
 
-        # Stage 3: Circular Moving-Window Pairwise 4-Gamete Embedding (W=314)
-        need_tf = config.scoring_mode in ("hybrid_flank", "standalone_tf")
-        if need_tf and progress_cb is not None:
-            progress_cb(f"transformer windows 0 of {M_tx}")
-        with recorder.measure_stage(
-            stage_id="pairwise_embed",
-            stage_name="3. Circular Window 4-Gamete Pairwise Embedding",
-            items_processed=M_tx if need_tf else 0,
-            items_unit="windows",
-            throughput_unit="win/s",
-            notes=(
-                f"Circular gamete frequency tensor ({M_tx:,}, {cfg.W}, 4)"
-                if need_tf
-                else "Skipped (KL-only scoring mode)"
-            ),
-        ):
-            X_embed = self._build_circular_windows_freq(haplo, cfg.W) if need_tf else None
-
-        # Stage 4: Window Transformer Forward Pass (JAX JIT Encoder)
-        with recorder.measure_stage(
-            stage_id="transformer_fwd",
-            stage_name="4. Window Transformer Forward Pass",
-            items_processed=M_tx if need_tf else 0,
-            items_unit="windows",
-            throughput_unit="win/s",
-            notes=(
-                f"{config.checkpoint} ({n_model_params:,} params, d={cfg.d_model}, {cfg.n_layers} layers)"
-                if need_tf
-                else f"Skipped (scoring_mode={config.scoring_mode})"
-            ),
-        ):
-            if need_tf and X_embed is not None:
-                tf_raw = self._score_transformer_static(
-                    params, cfg, score_fn, X_embed, progress_cb=progress_cb, cancel_check=cancel_check
-                )
-                tf_logits_b = np.concatenate([tf_raw, [tf_raw[0]]]).astype(np.float64)
-            else:
-                tf_logits_b = np.zeros(M_tx + 1, dtype=np.float64)
-            tf_prob_b = 1.0 / (1.0 + np.exp(-np.clip(tf_logits_b, -10.0, 10.0)))
-
-        if cancel_check is not None and cancel_check():
-            raise InterruptedError("Job cancelled by user")
-
-        # Adaptive bounds: dynamically adapt down to 6 for sensitive edge breakpoint recovery while protecting against extreme sub-6-site noise
+        # Adaptive bounds & multi-scale window set (computed before Stage 3 so Stage 5 can run concurrently in hybrid_flank mode)
         eff_min_seg = max(6, min(config.min_seg, max(6, int(M_tx * 0.01))))
         eff_L_w = min(config.flank_window, max(16, M_tx // 3))
         if config.scoring_mode == "global_kl":
@@ -962,7 +1429,6 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         else:
             eff_min_seg_global = eff_min_seg
 
-        # Multi-scale window set scaled to physical sequence length for short tract (>=100 bp) and long tract sensitivity
         col_density = float(M_tx) / max(float(L), 1.0)
         w_tight = max(24, min(eff_L_w, int(100.0 * col_density)))
         w_short = max(24, min(eff_L_w, int(250.0 * col_density)))
@@ -980,70 +1446,66 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         if not candidate_windows:
             candidate_windows = [eff_L_w]
 
-        # Stage 5: Local Flanking KL / Global KL & Permutation Null Calibration
-        if progress_cb is not None:
-            progress_cb("KL scan")
-        rng = np.random.default_rng(0)
+        need_tf = config.scoring_mode in ("hybrid_flank", "standalone_tf")
         need_kl = config.scoring_mode in ("hybrid_flank", "flank_kl", "global_kl")
-        with recorder.measure_stage(
-            stage_id="flank_kl_null",
-            stage_name="5. Flanking KL & Permutation Null Calibration",
-            items_processed=(M_tx + 1) if need_kl else 0,
-            items_unit="boundaries",
-            throughput_unit="bound/s",
-            notes=(
-                f"Legacy global KL (min_seg={eff_min_seg_global}, beta={config.beta:g})"
-                if config.scoring_mode == "global_kl"
-                else (
-                    f"Local flank_kl (windows={candidate_windows}, min_seg={eff_min_seg}, beta={config.beta:g}, 3x col-perm null)"
-                    if need_kl
-                    else "Skipped global null scan (standalone_tf mode)"
-                )
-            ),
-        ):
+
+        def _run_kl_stage() -> tuple[
+            np.ndarray,
+            dict[int, np.ndarray],
+            dict[int, np.ndarray],
+            dict[int, np.ndarray],
+            dict[int, np.ndarray],
+            float,
+        ]:
+            t_k0 = time.perf_counter()
+            rng_local = np.random.default_rng(0)
             if config.scoring_mode == "global_kl":
-                z_kl, _raw_kl, _null_kl = H.boundary_zscore(
-                    haplo, beta=config.beta, min_seg=eff_min_seg_global, kind="kl", rng=rng, n_perm=2
+                z_kl_out, _raw_kl, _null_kl = H.boundary_zscore(
+                    haplo, beta=config.beta, min_seg=eff_min_seg_global, kind="kl", rng=rng_local, n_perm=2
                 )
-                z_by_w = {w: z_kl for w in candidate_windows}
-                raw_by_w = {w: _raw_kl for w in candidate_windows}
+                z_map = {w: z_kl_out for w in candidate_windows}
+                raw_map = {w: _raw_kl for w in candidate_windows}
+                raw_max_map = {w: _raw_kl for w in candidate_windows}
+                z_is_max_map = {w: np.zeros_like(_raw_kl, dtype=bool) for w in candidate_windows}
             elif config.scoring_mode in ("hybrid_flank", "flank_kl"):
-                z_by_w = {}
-                raw_by_w = {}
+                z_map = {}
+                raw_map = {}
+                raw_max_map = {}
+                z_is_max_map = {}
+                max_z_thr = max(config.z_thresh + 2.0, 8.0)
+
+                def _dual_scan(w_scan: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                    z_s, z_m, raw_s, raw_m = H.boundary_zscore_flank_dual(
+                        haplo,
+                        L_w=w_scan,
+                        beta=config.beta,
+                        min_seg=eff_min_seg,
+                        power=1.0,
+                        rng=np.random.default_rng(0),
+                        n_perm=3,
+                        origin=origin,
+                    )
+                    if S >= 16:
+                        is_max = (z_m >= max_z_thr) & (z_m > z_s)
+                        z_fused = np.where(is_max, z_m, z_s)
+                        return z_fused, raw_s, raw_m, is_max
+                    return z_s, raw_s, raw_m, np.zeros_like(z_s, dtype=bool)
+
                 for w in scale_windows:
                     if cancel_check is not None and cancel_check():
                         raise InterruptedError("Job cancelled by user")
-                    z_w, raw_w, _ = H.boundary_zscore_flank(
-                        haplo,
-                        L_w=w,
-                        beta=config.beta,
-                        min_seg=eff_min_seg,
-                        power=1.0,
-                        rng=np.random.default_rng(0),
-                        n_perm=3,
-                        origin=origin,
-                    )
-                    z_by_w[w] = z_w
-                    raw_by_w[w] = raw_w
-                if w_tight not in z_by_w:
+                    z_map[w], raw_map[w], raw_max_map[w], z_is_max_map[w] = _dual_scan(w)
+                if w_tight not in z_map:
                     if cancel_check is not None and cancel_check():
                         raise InterruptedError("Job cancelled by user")
-                    z_wt, raw_wt, _ = H.boundary_zscore_flank(
-                        haplo,
-                        L_w=w_tight,
-                        beta=config.beta,
-                        min_seg=eff_min_seg,
-                        power=1.0,
-                        rng=np.random.default_rng(0),
-                        n_perm=3,
-                        origin=origin,
-                    )
-                    z_by_w[w_tight] = z_wt
-                    raw_by_w[w_tight] = raw_wt
-                # Combined multi-scale z profile across standard scales + high-confidence tight window (>= 12.0)
-                z_kl = np.maximum.reduce([z_by_w[w] for w in scale_windows])
-                if w_tight in z_by_w and w_tight not in scale_windows:
-                    z_kl = np.maximum(z_kl, np.where(z_by_w[w_tight] >= 12.0, z_by_w[w_tight], 0.0))
+                    z_map[w_tight], raw_map[w_tight], raw_max_map[w_tight], z_is_max_map[w_tight] = _dual_scan(w_tight)
+                if M_tx >= 64 and 16 < w_tight and 16 not in z_map and (eff_min_seg <= 16 or (16.0 / max(col_density, 1e-6)) >= 35.0):
+                    if cancel_check is not None and cancel_check():
+                        raise InterruptedError("Job cancelled by user")
+                    z_map[16], raw_map[16], raw_max_map[16], z_is_max_map[16] = _dual_scan(16)
+                z_kl_out = np.maximum.reduce([z_map[w] for w in scale_windows])
+                if w_tight in z_map and w_tight not in scale_windows:
+                    z_kl_out = np.maximum(z_kl_out, np.where(z_map[w_tight] >= 12.0, z_map[w_tight], 0.0))
             else:
                 z_w, raw_tight, _ = H.boundary_zscore_flank(
                     haplo,
@@ -1055,9 +1517,112 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     n_perm=3,
                     origin=origin,
                 )
-                z_kl = np.zeros(M_tx + 1, dtype=np.float64)
-                z_by_w = {w: z_w for w in candidate_windows}
-                raw_by_w = {w: raw_tight for w in candidate_windows}
+                z_kl_out = np.zeros(M_tx + 1, dtype=np.float64)
+                z_map = {w: z_w for w in candidate_windows}
+                raw_map = {w: raw_tight for w in candidate_windows}
+                raw_max_map = {w: raw_tight for w in candidate_windows}
+                z_is_max_map = {w: np.zeros_like(raw_tight, dtype=bool) for w in candidate_windows}
+            t_kl_ms = (time.perf_counter() - t_k0) * 1000.0
+            return z_kl_out, z_map, raw_map, raw_max_map, z_is_max_map, t_kl_ms
+
+        # Launch Stage 5 concurrently with Stage 3+4 in hybrid_flank mode
+        kl_executor: Optional[ThreadPoolExecutor] = None
+        kl_future = None
+        if config.scoring_mode == "hybrid_flank":
+            kl_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gt_kl_parallel")
+            kl_future = kl_executor.submit(_run_kl_stage)
+
+        try:
+            # Stage 3: Circular Moving-Window Pairwise 4-Gamete Embedding (W=314)
+            if need_tf and progress_cb is not None:
+                progress_cb(f"transformer windows 0 of {M_tx}")
+            with recorder.measure_stage(
+                stage_id="pairwise_embed",
+                stage_name="3. Circular Window 4-Gamete Pairwise Embedding",
+                items_processed=M_tx if need_tf else 0,
+                items_unit="windows",
+                throughput_unit="win/s",
+                notes=(
+                    f"Circular gamete frequency tensor ({M_tx:,}, {cfg.W}, 4)"
+                    if need_tf
+                    else "Skipped (KL-only scoring mode)"
+                ),
+            ):
+                X_embed = self._build_circular_windows_freq(haplo, cfg.W) if need_tf else None
+
+            # Stage 4: Window Transformer Forward Pass (JAX JIT Encoder)
+            with recorder.measure_stage(
+                stage_id="transformer_fwd",
+                stage_name="4. Window Transformer Forward Pass",
+                items_processed=M_tx if need_tf else 0,
+                items_unit="windows",
+                throughput_unit="win/s",
+                notes=(
+                    model_desc
+                    if need_tf
+                    else f"Skipped (scoring_mode={config.scoring_mode})"
+                ),
+            ):
+                if need_tf and X_embed is not None:
+                    rev_cache: dict[int, np.ndarray] = {}
+                    member_scores: list[np.ndarray] = []
+                    for (_mid, p_m, c_m, _), fn_m in zip(member_models, member_fns):
+                        x_m = X_embed if c_m.W == cfg.W else self._build_circular_windows_freq(haplo, c_m.W)
+                        sc_m = self._score_transformer_with_tta(
+                            p_m,
+                            c_m,
+                            fn_m,
+                            haplo,
+                            x_m,
+                            rev_cache,
+                            use_mirror_tta=config.use_mirror_tta,
+                            progress_cb=progress_cb,
+                            cancel_check=cancel_check,
+                        )
+                        member_scores.append(sc_m)
+                    tf_raw = self._fuse_ensemble_logits(member_scores)
+                    tf_logits_b = np.concatenate([tf_raw, [tf_raw[0]]]).astype(np.float64)
+                else:
+                    tf_logits_b = np.zeros(M_tx + 1, dtype=np.float64)
+                tf_prob_b = 1.0 / (1.0 + np.exp(-np.clip(tf_logits_b, -10.0, 10.0)))
+        finally:
+            if kl_future is not None:
+                try:
+                    z_kl, z_by_w, raw_by_w, raw_max_by_w, z_is_max_by_w, t_kl_ms = kl_future.result()
+                finally:
+                    if kl_executor is not None:
+                        kl_executor.shutdown(wait=False)
+
+        if cancel_check is not None and cancel_check():
+            raise InterruptedError("Job cancelled by user")
+
+        if kl_future is None:
+            if progress_cb is not None:
+                progress_cb("KL scan")
+            z_kl, z_by_w, raw_by_w, raw_max_by_w, z_is_max_by_w, t_kl_ms = _run_kl_stage()
+
+        kl_items = (M_tx + 1) if need_kl else 0
+        kl_notes = (
+            f"Legacy global KL (min_seg={eff_min_seg_global}, beta={config.beta:g})"
+            if config.scoring_mode == "global_kl"
+            else (
+                f"Local flank_kl (windows={candidate_windows}, min_seg={eff_min_seg}, beta={config.beta:g}, 3x col-perm null)"
+                if need_kl
+                else "Skipped global null scan (standalone_tf mode)"
+            )
+        )
+        recorder._stages_raw.append(
+            {
+                "stage_id": "flank_kl_null",
+                "stage_name": "5. Flanking KL & Permutation Null Calibration",
+                "duration_ms": round(t_kl_ms, 2),
+                "items_processed": kl_items,
+                "items_unit": "boundaries",
+                "throughput": round(kl_items / max(t_kl_ms / 1000.0, 1e-6), 1) if kl_items > 0 and t_kl_ms > 0 else None,
+                "throughput_unit": "bound/s",
+                "notes": kl_notes,
+            }
+        )
 
         if cancel_check is not None and cancel_check():
             raise InterruptedError("Job cancelled by user")
@@ -1086,6 +1651,8 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 candidate_windows=candidate_windows,
                 z_by_w=z_by_w,
                 raw_by_w=raw_by_w,
+                raw_max_by_w=raw_max_by_w,
+                z_is_max_by_w=z_is_max_by_w,
                 eff_min_seg=eff_min_seg,
                 eff_min_seg_global=eff_min_seg_global,
             )
@@ -1095,20 +1662,12 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 f"(merge_radius={config.merge_radius_bp} bp)"
             )
 
-        timings = recorder.finalize()
+        wall_total_ms = t_s1_ms + t_s2_ms + (time.perf_counter() - t_after_s2) * 1000.0
+        timings = recorder.finalize(wall_total_ms=wall_total_ms)
         self.timing_store.record(timings)
 
-        # Store alignment sequences in bounded LRU cache for RDP5 nucleotide alignment viewer
-        self._alignment_cache[timings.run_id] = {
-            "names": names,
-            "seqs": seqs,
-            "kept_set": set(int(c) for c in kept),
-            "L": L,
-        }
-        self._alignment_cache_order.append(timings.run_id)
-        while len(self._alignment_cache_order) > 8:
-            old_id = self._alignment_cache_order.pop(0)
-            self._alignment_cache.pop(old_id, None)
+        # Store alignment sequences in bounded LRU cache for nucleotide alignment viewer
+        self._store_alignment_cache(timings.run_id, names, seqs, kept, L)
 
         diagnostics = evaluate_predictions_against_ground_truth(
             consolidated_events=events,
@@ -1200,6 +1759,8 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         candidate_windows: list[int],
         z_by_w: dict[int, np.ndarray],
         raw_by_w: dict[int, np.ndarray],
+        raw_max_by_w: dict[int, np.ndarray],
+        z_is_max_by_w: dict[int, np.ndarray],
         eff_min_seg: int,
         eff_min_seg_global: int,
     ) -> tuple[list[ConsolidatedEvent], list[RawPeakCall], GenomeTrackProfile]:
@@ -1211,6 +1772,11 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
         ) * gate_linkage
 
         w_tight = min(candidate_windows) if candidate_windows else 16
+
+        def _raw_arr_for_window(w_pick: int, sub_idx: np.ndarray) -> np.ndarray:
+            peak_local = int(sub_idx[np.argmax(z_by_w[w_pick][sub_idx])])
+            use_max = bool(z_is_max_by_w[w_pick][peak_local]) if w_pick in z_is_max_by_w else False
+            return raw_max_by_w[w_pick] if (use_max and w_pick in raw_max_by_w) else raw_by_w[w_pick]
 
         def _refine_kl_peaks(kl_peaks_raw: list[int]) -> list[int]:
             # First identify genuine peaks (filtering out greedy pick_peaks mask cliffs on monotonic slopes)
@@ -1229,11 +1795,12 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     if max_z_w > best_z:
                         best_z = max_z_w
                         best_w = w
-                best_b = int(sub_idx[np.argmax(raw_by_w[best_w][sub_idx])])
+                raw_arr = _raw_arr_for_window(best_w, sub_idx)
+                best_b = int(sub_idx[np.argmax(raw_arr[sub_idx])])
                 tight_max_z = float(np.max(z_by_w[w_tight][sub_idx])) if w_tight in z_by_w else best_z
                 if tight_max_z < config.z_thresh:
-                    if (best_b == lo and lo > eff_min_seg and raw_by_w[best_w][lo - 1] > raw_by_w[best_w][best_b]) or (
-                        best_b == hi and hi < (M_tx - eff_min_seg) and raw_by_w[best_w][hi + 1] > raw_by_w[best_w][best_b]
+                    if (best_b == lo and lo > eff_min_seg and raw_arr[lo - 1] > raw_arr[best_b]) or (
+                        best_b == hi and hi < (M_tx - eff_min_seg) and raw_arr[hi + 1] > raw_arr[best_b]
                     ):
                         continue
                     if (lo > eff_min_seg and z_kl[lo - 1] > z_kl[best_b] * 1.02) or (
@@ -1261,18 +1828,56 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     if max_z_w > best_z:
                         best_z = max_z_w
                         best_w = w
-                best_b = int(sub_idx[np.argmax(raw_by_w[best_w][sub_idx])])
+                raw_arr = _raw_arr_for_window(best_w, sub_idx)
+                best_b = int(sub_idx[np.argmax(raw_arr[sub_idx])])
                 refined.append(best_b)
             return sorted(list(set(refined)))
 
         # Pick candidate peaks depending on scoring mode
         peak_sources: dict[int, str] = {}
+
+        def _rescue_micro_peaks(base_peaks: list[int]) -> list[int]:
+            if 16 not in z_by_w:
+                return base_peaks
+            z16 = z_by_w[16]
+            micro_raw = H.pick_peaks(z16, max(14.0, config.z_thresh + 8.0), radius=10, max_peaks=16)
+            if not micro_raw:
+                return base_peaks
+            out_peaks = list(base_peaks)
+            existing_origs = [
+                int(P.unshrink(P.normalise_boundary(int(b), maps), maps, L)) for b in out_peaks
+            ]
+            for bm in micro_raw:
+                bm_int = int(bm)
+                bm_orig = int(P.unshrink(P.normalise_boundary(bm_int, maps), maps, L))
+                nearest_idx = min(
+                    range(len(out_peaks)),
+                    key=lambda idx: abs(existing_origs[idx] - bm_orig),
+                    default=None,
+                )
+                if nearest_idx is None or abs(existing_origs[nearest_idx] - bm_orig) > 35:
+                    if len(out_peaks) < 64:
+                        out_peaks.append(bm_int)
+                        existing_origs.append(bm_orig)
+                        peak_sources[bm_int] = "micro_flank"
+                elif (
+                    abs(existing_origs[nearest_idx] - bm_orig) <= 25
+                    and float(z16[bm_int]) >= 18.0
+                    and float(z_kl[out_peaks[nearest_idx]]) < 25.0
+                ):
+                    old_b = out_peaks[nearest_idx]
+                    peak_sources.pop(old_b, None)
+                    out_peaks[nearest_idx] = bm_int
+                    existing_origs[nearest_idx] = bm_orig
+                    peak_sources[bm_int] = "micro_flank"
+            return sorted(list(set(out_peaks)))
+
         if config.scoring_mode == "flank_kl":
             kl_peaks_raw = H.pick_peaks(z_kl, config.z_thresh, radius=15, max_peaks=64)
             kl_peaks = _refine_kl_peaks(kl_peaks_raw)
             for b in kl_peaks:
                 peak_sources[int(b)] = "flank_kl"
-            ordered_peaks = kl_peaks
+            ordered_peaks = _rescue_micro_peaks(kl_peaks)
             pick_by = "prod"
         elif config.scoring_mode == "global_kl":
             kl_peaks = H.pick_peaks(z_kl, config.z_thresh, radius=20, max_peaks=64)
@@ -1301,27 +1906,41 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             ordered_peaks = sorted(list(set(int(b) for b in tf_peaks)))
             pick_by = "score"
         else:
-            # hybrid_flank: combine calibrated flank_kl peaks + non-overlapping confirmed TF peaks
+            # hybrid_flank: combine calibrated flank_kl peaks + micro short-tract peaks + non-overlapping confirmed TF peaks
             kl_peaks_raw = H.pick_peaks(z_kl, config.z_thresh, radius=15, max_peaks=64)
             kl_peaks = _refine_kl_peaks(kl_peaks_raw)
-            tf_peaks = H.pick_peaks(tf_logits_b, config.tf_logit_thresh, radius=20, max_peaks=64)
             for b in kl_peaks:
                 peak_sources[int(b)] = "flank_kl"
+            kl_peaks = _rescue_micro_peaks(kl_peaks)
+            tf_peaks = H.pick_peaks(tf_logits_b, config.tf_logit_thresh, radius=20, max_peaks=64)
             merged_peaks = list(kl_peaks)
+            tf_rescue_thr = max(config.tf_logit_thresh, 1.2)
             for b_tf in tf_peaks:
-                near_kl = [k for k in kl_peaks if abs(int(k) - int(b_tf)) <= 20]
+                b_tf_int = int(b_tf)
+                near_kl = [k for k in kl_peaks if abs(int(k) - b_tf_int) <= 20]
                 if near_kl:
-                    near_k = min(near_kl, key=lambda k: abs(int(k) - int(b_tf)))
+                    near_k = min(near_kl, key=lambda k: abs(int(k) - b_tf_int))
                     peak_sources[int(near_k)] = "hybrid"
-                elif all(abs(int(b_tf) - int(b_m)) > 20 for b_m in merged_peaks):
-                    # Check that b_tf is a genuine tight-window local switch peak, not a broad-window shoulder
-                    if w_tight in z_by_w and float(z_by_w[w_tight][int(b_tf)]) < config.z_thresh:
-                        continue
-                    if len(merged_peaks) < 64:
-                        merged_peaks.append(int(b_tf))
-                        peak_sources[int(b_tf)] = "transformer"
+                elif float(tf_logits_b[b_tf_int]) >= tf_rescue_thr and all(abs(b_tf_int - int(b_m)) > 20 for b_m in merged_peaks):
+                    lo_pin = max(eff_min_seg, b_tf_int - 10)
+                    hi_pin = min(M_tx - eff_min_seg, b_tf_int + 10)
+                    z_tight_arr = z_by_w.get(w_tight)
+                    if lo_pin <= hi_pin and z_tight_arr is not None:
+                        sub_pin = np.arange(lo_pin, hi_pin + 1)
+                        b_pin = int(sub_pin[np.argmax(z_tight_arr[sub_pin])])
+                        if (
+                            float(z_tight_arr[b_pin]) >= config.z_thresh
+                            and float(z_kl[b_pin]) >= 5.0
+                            and all(abs(b_pin - int(b_m)) > 20 for b_m in merged_peaks)
+                            and len(merged_peaks) < 64
+                        ):
+                            merged_peaks.append(b_pin)
+                            peak_sources[b_pin] = "transformer"
             ordered_peaks = sorted(merged_peaks)
             pick_by = "prod"
+
+        # Precompute full-alignment pairwise sequence identity matrix for clade-aware filtering
+        full_id = np.mean(haplo[:, :, None] == haplo[:, None, :], axis=0) if M_tx > 0 else np.eye(S, dtype=np.float64)
 
         raw_for_cons: list[dict[str, Any]] = []
         raw_peak_meta: dict[int, dict[str, Any]] = {}
@@ -1363,9 +1982,25 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                         best_detail = dt
                         best_w_used = w
 
-                # When tight window has strong independent z-score (>= 15.0), use tight window for carrier/parent attribution
-                # so adjacent breakpoints ~100 bp away do not bleed into the flanking window
-                if w_tight in z_by_w and float(z_by_w[w_tight][b_int]) >= 15.0:
+                # When tight/micro window has strong independent z-score (>= 15.0), use it for carrier/parent attribution
+                # so adjacent breakpoints ~60-100 bp away do not bleed into the flanking window
+                if 16 in z_by_w and (src == "micro_flank" or (float(z_by_w[16][b_int]) >= 18.0 and float(z_kl[b_int]) < 25.0)):
+                    dt_micro = H.flank_soft_switch_detail(
+                        haplo,
+                        b_int,
+                        L_w=16,
+                        beta=config.beta,
+                        min_seg=min(eff_min_seg, 6),
+                        kind="kl",
+                        top_members=20,
+                        member_frac=0.5,
+                        top_parents=5,
+                    )
+                    if dt_micro and dt_micro[0]["switch"] >= max(best_sw, 3.0):
+                        best_detail = dt_micro
+                        best_sw = dt_micro[0]["switch"]
+                        best_w_used = 16
+                elif w_tight in z_by_w and float(z_by_w[w_tight][b_int]) >= 15.0:
                     dt_tight = H.flank_soft_switch_detail(
                         haplo,
                         b_int,
@@ -1379,15 +2014,13 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     )
                     if dt_tight and dt_tight[0]["switch"] >= 0.85 * best_sw and dt_tight[0]["switch"] >= 3.0:
                         best_detail = dt_tight
+                        best_w_used = w_tight
 
                 detail = best_detail
                 if not detail:
                     continue
 
                 # Filter out reciprocal mirror-donor artifacts from detail:
-                # When recombinant R copies donor P on one flank, P's closest relative on that flank
-                # becomes R (yielding a mirror switch score for P), while P remains in its own parental
-                # clade across the boundary. True sibling carriers match R on BOTH flanks.
                 filtered_detail = [detail[0]]
                 higher_seqs = {int(detail[0]["recombinant"])}
                 higher_parents = {int(detail[0]["parent_left"]), int(detail[0]["parent_right"])}
@@ -1407,7 +2040,7 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     higher_parents.add(c_pR)
                 detail = filtered_detail
 
-                z_val = float(z_kl[b_int])
+                z_val = max(float(z_kl[b_int]), float(z_by_w[16][b_int])) if src == "micro_flank" and 16 in z_by_w else float(z_kl[b_int])
                 tf_peak = float(tf_logits_b[b_int])
                 lo_tf = max(0, b_int - 20)
                 hi_tf = min(M_tx + 1, b_int + 21)
@@ -1415,19 +2048,79 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 w_eff = min(best_w_used, b_int, M_tx - b_int)
                 b_orig = int(P.unshrink(P.normalise_boundary(b_int, maps), maps, L))
 
-                # Distinct parent check: at least one recombinant candidate must switch parents
+                # Clonal-sibling-aware precision filters (Filters A & B)
+                r_primary = detail[0]
+                r_idx0 = int(r_primary["recombinant"])
+                w_chk_ext = min(best_w_used, b_int, M_tx - b_int, 50)
+                clonal_sibs: set[int] = set()
+                dc_ext = 0.0
+                ext_L_clean = int(r_primary["parent_left"])
+                ext_R_clean = int(r_primary["parent_right"])
+
+                def _compute_dc_ext(w_win: int) -> tuple[float, set[int], int, int]:
+                    lh_e = haplo[b_int - w_win : b_int]
+                    rh_e = haplo[b_int : b_int + w_win]
+                    sim_L = np.mean(lh_e == lh_e[:, r_idx0 : r_idx0 + 1], axis=0)
+                    sim_R = np.mean(rh_e == rh_e[:, r_idx0 : r_idx0 + 1], axis=0)
+                    sibs = {
+                        s_i for s_i in range(S)
+                        if s_i != r_idx0 and float(sim_L[s_i]) >= 0.995 and float(sim_R[s_i]) >= 0.995
+                    }
+                    excl_ext = {int(x["recombinant"]) for x in detail} | sibs | {r_idx0}
+                    avail_ext = [s_i for s_i in range(S) if s_i not in excl_ext]
+                    if not avail_ext:
+                        avail_ext = [s_i for s_i in range(S) if s_i != r_idx0]
+                    if not avail_ext:
+                        return 0.0, sibs, ext_L_clean, ext_R_clean
+                    eL = max(avail_ext, key=lambda s_i: float(sim_L[s_i]))
+                    eR = max(avail_ext, key=lambda s_i: float(sim_R[s_i]))
+                    val = (
+                        (float(sim_L[eL]) - float(sim_L[eR]))
+                        + (float(sim_R[eR]) - float(sim_R[eL]))
+                    )
+                    return val, sibs, eL, eR
+
+                if w_chk_ext >= 8:
+                    dc_ext_short, clonal_sibs, ext_L_clean, ext_R_clean = _compute_dc_ext(w_chk_ext)
+                    dc_ext = dc_ext_short
+                    if w_eff > 50:
+                        dc_ext_full, _, ext_L_full, ext_R_full = _compute_dc_ext(w_eff)
+                        if dc_ext_full > dc_ext:
+                            dc_ext = dc_ext_full
+                            ext_L_clean, ext_R_clean = ext_L_full, ext_R_full
+                    if dc_ext < 0.15 and src != "transformer":
+                        continue
+
+                    # Filter B: Mid-tract continuity / jump-over veto when wide flank similarity drops < 0.72
+                    if min(float(r_primary.get("left_sim", 1.0)), float(r_primary.get("right_sim", 1.0))) < 0.72:
+                        w_loc = min(w_tight, 24, b_int, M_tx - b_int)
+                        if w_loc >= 8:
+                            lh_loc = haplo[b_int - w_loc : b_int]
+                            rh_loc = haplo[b_int : b_int + w_loc]
+                            sim_Ll = np.mean(lh_loc == lh_loc[:, r_idx0 : r_idx0 + 1], axis=0)
+                            sim_Rl = np.mean(rh_loc == rh_loc[:, r_idx0 : r_idx0 + 1], axis=0)
+                            non_sibs = [s_i for s_i in range(S) if s_i != r_idx0 and s_i not in clonal_sibs]
+                            max_both = max((min(float(sim_Ll[s_i]), float(sim_Rl[s_i])) for s_i in non_sibs), default=0.0)
+                            if max_both >= 0.92:
+                                continue
+
+                # Distinct parent check: local detail switch OR external non-carrier parent switch
                 distinct_parent_recombs = [r for r in detail if int(r["parent_left"]) != int(r["parent_right"])]
-                if not distinct_parent_recombs and src != "transformer":
+                has_distinct_parents = bool(distinct_parent_recombs) or (ext_L_clean != ext_R_clean and dc_ext >= 0.15)
+                if not has_distinct_parents and src != "transformer":
                     continue
 
-                # Compute multi-site contiguous tract evidence for top distinct recombinant candidate
+                # Compute multi-site contiguous tract evidence for top distinct recombinant or external parent pair
                 n_tract_support = 0
                 min_side_support = 0
-                if distinct_parent_recombs:
-                    r_top = distinct_parent_recombs[0]
-                    r_idx = int(r_top["recombinant"])
-                    pL = int(r_top["parent_left"])
-                    pR = int(r_top["parent_right"])
+                if distinct_parent_recombs or has_distinct_parents:
+                    if distinct_parent_recombs:
+                        r_top = distinct_parent_recombs[0]
+                        r_idx = int(r_top["recombinant"])
+                        pL = int(r_top["parent_left"])
+                        pR = int(r_top["parent_right"])
+                    else:
+                        r_idx, pL, pR = r_idx0, ext_L_clean, ext_R_clean
                     w_chk = min(w_eff, 50)
                     if w_chk > 0:
                         left_H = haplo[max(0, b_int - w_chk) : b_int]
@@ -1452,9 +2145,18 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
 
                 if config.scoring_mode == "hybrid_flank":
                     if src == "transformer":
-                        # Transformer-only peaks without matching KL peak require spatial linkage:
-                        # elevated logit >= 1.0, corroborated linkage z >= 5.0, and primary switch evidence >= 1.0
-                        if tf_logits_b[b_int] < 1.0 or z_kl[b_int] < 5.0 or best_sw < 1.0:
+                        # Transformer-pinned peaks require strong local TF support, tight-window switch, linkage & tract evidence
+                        z_tight_ok = (b_int < len(z_by_w[w_tight]) and float(z_by_w[w_tight][b_int]) >= config.z_thresh) if w_tight in z_by_w else True
+                        if (
+                            local_max_tf < max(config.tf_logit_thresh, 1.2)
+                            or not z_tight_ok
+                            or z_kl[b_int] < 5.0
+                            or best_sw < 1.0
+                            or dc_ext < 0.20
+                            or not has_distinct_parents
+                            or n_tract_support < 3
+                            or min_side_support < 1
+                        ):
                             continue
                     else:
                         # Negative logit veto:
@@ -1462,7 +2164,7 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                         # reject unless corroborated by contiguous multi-site tract evidence (>= 3 supporting sites, min side >= 1, best_sw >= 1.5).
                         if tf_peak <= -1.0 or local_max_tf <= 0.0:
                             has_tract_corroboration = (
-                                len(distinct_parent_recombs) > 0
+                                has_distinct_parents
                                 and n_tract_support >= 3
                                 and min_side_support >= 1
                                 and best_sw >= 1.5
@@ -1515,10 +2217,11 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             else:
                 sc_val = float(z_kl[b_int])
 
+            eff_z_val = max(float(z_kl[b_int]), float(z_by_w[16][b_int])) if src == "micro_flank" and 16 in z_by_w else float(z_kl[b_int])
             raw_for_cons.append(
                 {
                     "boundary_tx": b_int,
-                    "score": sc_val,
+                    "score": float(hybrid_profile[b_int]) if src == "transformer" else eff_z_val,
                     "breakpoint_orig": b_orig,
                     "n_switch": len(detail),
                     "recombinants": detail,
@@ -1526,37 +2229,57 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
             )
             raw_peak_meta[b_int] = {
                 "source": src,
-                "z_kl": float(z_kl[b_int]),
+                "z_kl": eff_z_val,
                 "tf_logit": float(tf_logits_b[b_int]),
                 "tf_prob": float(tf_prob_b[b_int]),
                 "hybrid": float(hybrid_profile[b_int]),
             }
 
-        # Suppress weaker shoulder echoes that repeat the exact same (recombinant, parent_left, parent_right)
-        # transition within 200 bp with no opposite switch in between
+        # Filter C: Clade-aware shoulder echo suppression within 220 bp (respecting opposite-switch boundaries)
         if len(raw_for_cons) >= 2:
+            def _ext_pair(rp: dict[str, Any]) -> tuple[int, int, int, set[int]]:
+                r_l = rp.get("recombinants", [])
+                r0 = r_l[0]
+                cset = {int(x["recombinant"]) for x in r_l}
+                r_idx = int(r0["recombinant"])
+                sibs = {s_i for s_i in range(S) if full_id[r_idx, s_i] >= 0.995}
+                excl = cset | sibs
+                el = [x for x in r0.get("left_candidates", []) if int(x["seq"]) not in excl] or r0.get("left_candidates", [])
+                er = [x for x in r0.get("right_candidates", []) if int(x["seq"]) not in excl] or r0.get("right_candidates", [])
+                pL = int(el[0]["seq"]) if el else int(r0["parent_left"])
+                pR = int(er[0]["seq"]) if er else int(r0["parent_right"])
+                return r_idx, pL, pR, cset
+
+            peak_info = [_ext_pair(rp) for rp in raw_for_cons]
             filtered_raw: list[dict[str, Any]] = []
             for idx_p, rp in enumerate(raw_for_cons):
-                r_list = rp.get("recombinants", [])
-                if not r_list:
-                    filtered_raw.append(rp)
-                    continue
-                r0 = r_list[0]
-                sig = (int(r0["recombinant"]), int(r0["parent_left"]), int(r0["parent_right"]))
+                r_i, pLi, pRi, cset_i = peak_info[idx_p]
+                r0 = rp["recombinants"][0]
                 bp_i = int(rp["breakpoint_orig"])
                 sc_i = float(rp["score"]) * float(r0.get("switch", 1.0))
                 is_shoulder_echo = False
                 for idx_q, rq in enumerate(raw_for_cons):
                     if idx_q == idx_p:
                         continue
-                    rq_list = rq.get("recombinants", [])
-                    if not rq_list:
-                        continue
-                    rq0 = rq_list[0]
-                    sig_q = (int(rq0["recombinant"]), int(rq0["parent_left"]), int(rq0["parent_right"]))
+                    r_q, pLq, pRq, cset_q = peak_info[idx_q]
+                    rq0 = rq["recombinants"][0]
                     bp_q = int(rq["breakpoint_orig"])
                     sc_q = float(rq["score"]) * float(rq0.get("switch", 1.0))
-                    if sig == sig_q and abs(bp_i - bp_q) <= 200 and sc_q > sc_i:
+                    if abs(bp_i - bp_q) > 220 or sc_q <= sc_i:
+                        continue
+                    same_carrier = bool(cset_i & cset_q) or float(full_id[r_i, r_q]) >= 0.98
+                    same_dir = float(full_id[pLi, pLq]) >= 0.92 and float(full_id[pRi, pRq]) >= 0.92
+                    if not (same_carrier and same_dir):
+                        continue
+                    lo_bp, hi_bp = min(bp_i, bp_q), max(bp_i, bp_q)
+                    has_opp_between = any(
+                        lo_bp < int(rm["breakpoint_orig"]) < hi_bp
+                        and (bool(cset_i & peak_info[idx_m][3]) or float(full_id[r_i, peak_info[idx_m][0]]) >= 0.98)
+                        and float(full_id[pLi, peak_info[idx_m][2]]) >= 0.92
+                        and float(full_id[pRi, peak_info[idx_m][1]]) >= 0.92
+                        for idx_m, rm in enumerate(raw_for_cons)
+                    )
+                    if not has_opp_between:
                         is_shoulder_echo = True
                         break
                 if not is_shoulder_echo:
@@ -1635,8 +2358,14 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 pR = int(r["parent_right"])
                 l_cands = r.get("left_candidates", [])
                 r_cands = r.get("right_candidates", [])
-                ext_l_cands = [c for c in l_cands if int(c["seq"]) not in carrier_set]
-                ext_r_cands = [c for c in r_cands if int(c["seq"]) not in carrier_set]
+                sibs_r = {s_i for s_i in range(S) if s_i != r_idx and float(full_id[r_idx, s_i]) >= 0.995}
+                ext_mask = carrier_set | sibs_r
+                ext_l_cands = [c for c in l_cands if int(c["seq"]) not in ext_mask]
+                if not ext_l_cands:
+                    ext_l_cands = [c for c in l_cands if int(c["seq"]) not in carrier_set]
+                ext_r_cands = [c for c in r_cands if int(c["seq"]) not in ext_mask]
+                if not ext_r_cands:
+                    ext_r_cands = [c for c in r_cands if int(c["seq"]) not in carrier_set]
                 ext_L = int(ext_l_cands[0]["seq"]) if ext_l_cands else pL
                 ext_R = int(ext_r_cands[0]["seq"]) if ext_r_cands else pR
                 ext_L_name = format_parent_with_ties(ext_l_cands, ext_L)
@@ -1691,7 +2420,7 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                 else:
                     sig_attr = "standalone_tf"
                     attr_note = f"Transformer prediction without flanking KL peak (logit={tf_log:.2f})"
-            elif config.scoring_mode == "flank_kl" or src == "flank_kl" or src == "hybrid":
+            elif config.scoring_mode == "flank_kl" or src in ("flank_kl", "micro_flank", "hybrid"):
                 if tf_log >= config.tf_logit_thresh and M_tx >= 314:
                     if src == "hybrid":
                         sig_attr = "hybrid_flank"
@@ -1732,6 +2461,8 @@ class GTTransformerInferenceEngine(BaseInferenceEngine):
                     recombinants=recombs_out,
                 )
             )
+
+        assign_ancestral_event_ids(consolidated_events)
 
         raw_peaks_out: list[RawPeakCall] = []
         for rp in raw_for_cons:

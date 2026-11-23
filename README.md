@@ -4,8 +4,8 @@ emoji: 🧬
 colorFrom: blue
 colorTo: indigo
 sdk: docker
-app_port: 7860
-short_description: RDP5-style recombination inference and diagnostics UI
+app_port: 8080
+short_description: Recombination breakpoint inference and diagnostics workbench
 ---
 
 # gt-transformer-web

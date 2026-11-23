@@ -66,9 +66,10 @@ class TestStandalonePortability(unittest.TestCase):
 
     def test_02_bundled_checkpoint_and_data_integrity(self) -> None:
         """Verify bundled checkpoints, sample FASTA datasets, and benchmark data exist."""
-        ckpt_path = WEB_ROOT / "checkpoints" / "ckpt_N10000_extreme" / "params.pkl"
-        self.assertTrue(ckpt_path.is_file(), f"Bundled checkpoint missing: {ckpt_path}")
-        self.assertGreater(ckpt_path.stat().st_size, 2_000_000, "Checkpoint file truncated")
+        for cid in ("ckpt_N40000", "ckpt_N10000", "ckpt_N10000_extreme", "ckpt_N10000_v2"):
+            ckpt_path = WEB_ROOT / "checkpoints" / cid / "params.pkl"
+            self.assertTrue(ckpt_path.is_file(), f"Bundled checkpoint missing: {ckpt_path}")
+            self.assertGreater(ckpt_path.stat().st_size, 2_000_000, f"Checkpoint file truncated: {cid}")
 
         # Verify key sample FASTAs
         required_samples = [
@@ -87,7 +88,13 @@ class TestStandalonePortability(unittest.TestCase):
 
         # Verify benchmark summaries
         bench_dir = WEB_ROOT / "benchmark_data"
-        for name in ["scaling_results_summary.csv", "out_of_range_results_summary.csv", "eval_summary_N10000.json", "eval_comparison_before_after.json"]:
+        for name in [
+            "scaling_results_summary.csv",
+            "out_of_range_results_summary.csv",
+            "eval_summary_N10000.json",
+            "eval_summary_N40000.json",
+            "eval_comparison_before_after.json",
+        ]:
             self.assertTrue((bench_dir / name).is_file(), f"Bundled benchmark data missing: {name}")
 
     def test_03_inference_adapter_standalone_discovery(self) -> None:

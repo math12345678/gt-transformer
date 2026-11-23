@@ -84,6 +84,10 @@ def consolidate_peaks(raw_events, merge_radius_bp=75, pick_by="score"):
         primary = recombs_sorted[0]["recombinant"] if recombs_sorted else None
         max_sw = float(recombs_sorted[0].get("switch", 0.0)) if recombs_sorted else 0.0
         top3 = set(r["recombinant"] for r in recombs_sorted[:3])
+        pL = int(recombs_sorted[0]["parent_left"]) if recombs_sorted else None
+        pR = int(recombs_sorted[0]["parent_right"]) if recombs_sorted else None
+        if pL is not None and pL == pR:
+            pL, pR = None, None
         p_list.append({
             "boundary_tx": p.get("boundary_tx", 0),
             "breakpoint_orig": p["breakpoint_orig"],
@@ -92,6 +96,8 @@ def consolidate_peaks(raw_events, merge_radius_bp=75, pick_by="score"):
             "carrier_set": cset,
             "primary": primary,
             "top3": top3,
+            "pL": pL,
+            "pR": pR,
             "recombinants": recombs
         })
         
@@ -101,7 +107,17 @@ def consolidate_peaks(raw_events, merge_radius_bp=75, pick_by="score"):
         for j in range(i + 1, N):
             bp_dist = abs(p_list[i]["breakpoint_orig"] - p_list[j]["breakpoint_orig"])
             if bp_dist <= merge_radius_bp:
-                if (p_list[i]["primary"] == p_list[j]["primary"] or 
+                opp_switch = (
+                    p_list[i]["pL"] is not None
+                    and p_list[j]["pL"] is not None
+                    and p_list[i]["pL"] != p_list[j]["pL"]
+                    and p_list[i]["pR"] != p_list[j]["pR"]
+                    and (
+                        p_list[i]["pL"] == p_list[j]["pR"]
+                        or p_list[i]["pR"] == p_list[j]["pL"]
+                    )
+                )
+                if not opp_switch and (p_list[i]["primary"] == p_list[j]["primary"] or 
                     (p_list[i]["top3"] & p_list[j]["top3"])):
                     adj[i].append(j)
                     adj[j].append(i)

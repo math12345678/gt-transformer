@@ -87,15 +87,20 @@ class TimingRecorder:
                 }
             )
 
-    def finalize(self) -> InferenceTimingReport:
+    def finalize(self, wall_total_ms: Optional[float] = None) -> InferenceTimingReport:
         """Build the finalized InferenceTimingReport with stage percentages."""
-        total_ms = sum(s["duration_ms"] for s in self._stages_raw)
+        sum_stage_ms = sum(s["duration_ms"] for s in self._stages_raw)
+        if wall_total_ms is not None and wall_total_ms > 0:
+            total_ms = float(wall_total_ms)
+        else:
+            total_ms = sum_stage_ms
         if total_ms <= 0:
             total_ms = max((time.perf_counter() - self._t0_wall) * 1000.0, 0.01)
 
+        pct_denom = max(sum_stage_ms, total_ms, 1e-6)
         stages: list[StageTiming] = []
         for s in self._stages_raw:
-            pct = (s["duration_ms"] / total_ms * 100.0) if total_ms > 0 else 0.0
+            pct = min(100.0, (s["duration_ms"] / pct_denom * 100.0))
             stages.append(
                 StageTiming(
                     stage_id=s["stage_id"],

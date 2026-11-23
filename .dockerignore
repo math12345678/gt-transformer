@@ -1,5 +1,9 @@
 .git
 .agents
+.claude
+.env
+*.db
+*.sqlite*
 __pycache__
 *.py[cod]
 *$py.class

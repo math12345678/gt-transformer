@@ -17,6 +17,9 @@ venv/
 *.bak
 
 # Local runtime state & logs
+.env
+recomb_app.db
+checkpoints/ckpt_user_adaptive/
 timing_history.json
 reviewer_annotations.json
 *.log

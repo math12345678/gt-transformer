@@ -13,12 +13,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copy application and bundled checkpoints (ckpt_N10000 and ckpt_N10000_extreme)
+# Copy application and bundled checkpoints (ckpt_N40000, ckpt_N10000, ckpt_N10000_extreme, and ckpt_N10000_v2)
 COPY . .
+RUN chmod -R a+rwX /app
 
 ENV HOST=0.0.0.0
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
+ENV OMP_NUM_THREADS=2
+ENV OPENBLAS_NUM_THREADS=2
 
 EXPOSE 8080
 

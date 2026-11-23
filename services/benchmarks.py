@@ -42,6 +42,9 @@ def load_benchmark_summaries() -> dict[str, Any]:
     eval_10k_path = _resolve_path("eval_summary_N10000.json", GT_ROOT / "out_N10000" / "eval_summary_N10000.json")
     eval_10k = json.loads(eval_10k_path.read_text(encoding="utf-8")) if eval_10k_path.exists() else {}
 
+    eval_40k_path = _resolve_path("eval_summary_N40000.json", GT_ROOT / "out_N40000" / "eval_summary_N40000.json")
+    eval_40k = json.loads(eval_40k_path.read_text(encoding="utf-8")) if eval_40k_path.exists() else {}
+
     eval_ext_path = _resolve_path("eval_comparison_before_after.json", GT_ROOT / "out_extreme" / "eval_comparison_before_after.json")
     eval_ext = json.loads(eval_ext_path.read_text(encoding="utf-8")) if eval_ext_path.exists() else {}
 
@@ -55,5 +58,6 @@ def load_benchmark_summaries() -> dict[str, Any]:
             "rows": extreme_rows[1:] if len(extreme_rows) > 1 else [],
         },
         "eval_10k_summary": eval_10k,
+        "eval_40k_summary": eval_40k,
         "eval_extreme_comparison": eval_ext,
     }

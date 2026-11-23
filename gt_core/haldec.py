@@ -126,31 +126,18 @@ def segment_switch(H, thrL=0.9, thrR=0.9, margin=0.02, min_seg=3):
     return score, switch
 
 
-def flank_kl_score(H, L_w=250, min_seg=50, beta=20.0, power=0.5):
-    """Symmetric variance-stabilised local flanking KL score, length M + 1.
-
-    Why this improves on the global prefix/suffix `segment_score`:
-      1. The global prefix `[0, b)` vs suffix `[b, M)` has binomial sampling
-         variance proportional to `1/b + 1/(M-b)`, creating a 3-4.4x U-shaped
-         baseline distortion near alignment ends and preventing `min_seg` from
-         being lowered below 200 without inflating false positives.
-      2. On double-crossover events `[b1, b2]`, a global suffix `[b1, M)`
-         dilutes the recombinant tract `[b1, b2]` with the non-recombinant
-         tail `[b2, M)`.
-
-    At each boundary `b in [min_seg, M - min_seg]`, this compares the symmetric
-    local flanking windows `[b - w, b)` and `[b, b + w)` where
-    `w = min(L_w, b, M - b)`, scaled by the variance-stabilising factor
-    `(w / L_w)**power`.  Uses O(M * S^2) rolling {-1, +1} outer products with
-    O(S^2) memory.
-    """
+def flank_kl_score_dual(H, L_w=250, min_seg=50, beta=20.0, power=0.5):
+    """Compute both sequence-summed and per-sequence-max local flanking KL scores `(score_sum, score_max)`."""
     M, S = H.shape
     Z = 2 * H.astype(np.int16) - 1
-    score = np.zeros(M + 1, dtype=np.float64)
+    score_sum = np.zeros(M + 1, dtype=np.float64)
+    score_max = np.zeros(M + 1, dtype=np.float64)
+    if M < 2 * min_seg or L_w < 1 or min_seg < 1:
+        return score_sum, score_max
     diag = np.arange(S)
     w_prev = min(L_w, min_seg, M - min_seg)
-    if w_prev < min_seg:
-        return score
+    if w_prev < 1:
+        return score_sum, score_max
     b0 = min_seg
     L_blk = Z[b0 - w_prev : b0].astype(np.int32)
     R_blk = Z[b0 : b0 + w_prev].astype(np.int32)
@@ -199,8 +186,14 @@ def flank_kl_score(H, L_w=250, min_seg=50, beta=20.0, power=0.5):
         kl = 0.5 * ((qL * (logL - logR)).sum(axis=0)
                     + (qR * (logR - logL)).sum(axis=0))
         scale = (w / float(L_w)) ** power if power != 0.0 else 1.0
-        score[b] = float(kl.sum()) * scale
-    return score
+        score_sum[b] = float(kl.sum()) * scale
+        score_max[b] = float(kl.max()) * scale
+    return score_sum, score_max
+
+
+def flank_kl_score(H, L_w=250, min_seg=50, beta=20.0, power=0.5):
+    """Symmetric variance-stabilised local flanking KL score, length M + 1."""
+    return flank_kl_score_dual(H, L_w=L_w, min_seg=min_seg, beta=beta, power=power)[0]
 
 
 def segment_score(H, kind="hard", thrL=0.9, thrR=0.9, margin=0.02, beta=20.0,
@@ -538,33 +531,8 @@ def flank_soft_switch_detail(H, b, L_w=250, beta=20.0, min_seg=3, kind="kl",
 
 
 # ------------------------------------------------------------------- peak picking
-def boundary_zscore_flank(H, L_w=250, beta=20.0, min_seg=50, power=1.0,
-                          rng=None, n_perm=3, origin=None):
-    """Calibrated boundary profile for `flank_kl_score` using window-stratified permutation null.
-
-    Why window-stratified null standardization:
-      1. Effective flanking half-windows truncate near sequence boundaries:
-         w(b) = min(L_w, b, M - b). As w shrinks near boundaries, pairwise binomial
-         sampling variance increases as 1/w, inflating raw flanking KL scores.
-      2. Setting power=1.0 variance-stabilises the score by (w / L_w)**1.0, cancelling
-         the 1/w divergence across window scales.
-      3. Scalar pooling across all boundaries b in [min_seg, M - min_seg] creates a
-         pooling fallacy: because >85% of boundaries are in the flat interior (w = L_w),
-         the pooled mean and std are dominated by the interior, shifting expected edge
-         null z-scores to +3.90 standard deviations and triggering spurious edge calls.
-      4. Standardizing using stratified median and robust scale profiles within windows
-         of effective window width w(b) eliminates edge false positives while preserving
-         high sensitivity (E[z] = 0, Var(z) = 1 across all window depths).
-      5. Grouping transformed columns by original alignment site (`origin`) preserves
-         multi-allelic duplicated column pairings under permutation null.
-    """
-    if rng is None:
-        rng = np.random.default_rng(0)
-    M, _S = H.shape
-    score = flank_kl_score(H, L_w=L_w, min_seg=min_seg, beta=beta, power=power)
-    if M <= 2 * min_seg:
-        return np.zeros_like(score), score, np.zeros_like(score)
-
+def _build_origin_groups(H, origin):
+    M = H.shape[0]
     if origin is not None and len(origin) == M:
         orig_dict = {}
         unique_origs = []
@@ -573,34 +541,21 @@ def boundary_zscore_flank(H, L_w=250, beta=20.0, min_seg=50, power=1.0,
                 unique_origs.append(o)
                 orig_dict[o] = []
             orig_dict[o].append(i)
-        groups = [orig_dict[o] for o in unique_origs]
-    else:
-        # Group adjacent duplicate / near-duplicate columns from multi-allelic site binarisation
-        groups = []
-        cur_group = [0]
-        for i in range(1, M):
-            if np.count_nonzero(H[i] != H[i - 1]) <= 1:
-                cur_group.append(i)
-            else:
-                groups.append(cur_group)
-                cur_group = [i]
-        groups.append(cur_group)
+        return [orig_dict[o] for o in unique_origs]
+    groups = []
+    cur_group = [0]
+    for i in range(1, M):
+        if np.count_nonzero(H[i] != H[i - 1]) <= 1:
+            cur_group.append(i)
+        else:
+            groups.append(cur_group)
+            cur_group = [i]
+    groups.append(cur_group)
+    return groups
 
-    def _permute_H(rng):
-        perm_g = rng.permutation(len(groups))
-        idx = []
-        for g in perm_g:
-            idx.extend(groups[g])
-        return H[idx]
 
-    null_matrix = np.zeros((n_perm, M + 1), dtype=np.float64)
-    for p in range(n_perm):
-        Hp = _permute_H(rng)
-        null_matrix[p] = flank_kl_score(Hp, L_w=L_w, min_seg=min_seg, beta=beta, power=power)
-
-    null_mean_prof = null_matrix.mean(axis=0)
-
-    # Continuous Parametric Variance Model with Interior Pooling & Scale Floor
+def _standardize_flank_profile(score, null_matrix, L_w, min_seg):
+    M = len(score) - 1
     w_arr = np.array([min(L_w, b, M - b) for b in range(M + 1)])
     legal_indices = np.arange(min_seg, M - min_seg + 1)
     legal_w = w_arr[legal_indices]
@@ -632,7 +587,59 @@ def boundary_zscore_flank(H, L_w=250, beta=20.0, min_seg=50, power=1.0,
 
     z = np.zeros_like(score)
     z[legal_indices] = (score[legal_indices] - mu_w[legal_indices]) / np.maximum(scale_w[legal_indices], 1e-6)
+    return z
 
+
+def boundary_zscore_flank_dual(H, L_w=250, beta=20.0, min_seg=50, power=1.0,
+                               rng=None, n_perm=3, origin=None):
+    """Calibrated dual profiles `(z_sum, z_max, raw_sum, raw_max)` sharing the same permutation null."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    M, _S = H.shape
+    raw_sum, raw_max = flank_kl_score_dual(H, L_w=L_w, min_seg=min_seg, beta=beta, power=power)
+    if M <= 2 * min_seg:
+        zeros = np.zeros_like(raw_sum)
+        return zeros, zeros.copy(), raw_sum, raw_max
+
+    groups = _build_origin_groups(H, origin)
+    null_sum = np.zeros((n_perm, M + 1), dtype=np.float64)
+    null_max = np.zeros((n_perm, M + 1), dtype=np.float64)
+    for p in range(n_perm):
+        perm_g = rng.permutation(len(groups))
+        idx = []
+        for g in perm_g:
+            idx.extend(groups[g])
+        Hp = H[idx]
+        null_sum[p], null_max[p] = flank_kl_score_dual(
+            Hp, L_w=L_w, min_seg=min_seg, beta=beta, power=power
+        )
+
+    z_sum = _standardize_flank_profile(raw_sum, null_sum, L_w, min_seg)
+    z_max = _standardize_flank_profile(raw_max, null_max, L_w, min_seg)
+    return z_sum, z_max, raw_sum, raw_max
+
+
+def boundary_zscore_flank(H, L_w=250, beta=20.0, min_seg=50, power=1.0,
+                          rng=None, n_perm=3, origin=None):
+    """Calibrated boundary profile for `flank_kl_score` using window-stratified permutation null."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    M, _S = H.shape
+    score = flank_kl_score(H, L_w=L_w, min_seg=min_seg, beta=beta, power=power)
+    if M <= 2 * min_seg:
+        return np.zeros_like(score), score, np.zeros_like(score)
+
+    groups = _build_origin_groups(H, origin)
+    null_matrix = np.zeros((n_perm, M + 1), dtype=np.float64)
+    for p in range(n_perm):
+        perm_g = rng.permutation(len(groups))
+        idx = []
+        for g in perm_g:
+            idx.extend(groups[g])
+        null_matrix[p] = flank_kl_score(H[idx], L_w=L_w, min_seg=min_seg, beta=beta, power=power)
+
+    null_mean_prof = null_matrix.mean(axis=0)
+    z = _standardize_flank_profile(score, null_matrix, L_w, min_seg)
     return z, score, null_mean_prof
 
 def boundary_null(H, beta=20.0, min_seg=200, kind="kl", rng=None, n_perm=2):

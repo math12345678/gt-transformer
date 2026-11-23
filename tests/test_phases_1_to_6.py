@@ -46,7 +46,8 @@ class TestPhases1To6(unittest.TestCase):
         self.assertEqual(data["status"], "ok")
         self.assertTrue(data["model_loaded"])
         self.assertGreater(data["startup_load_ms"], 0.0)
-        # Verify both checkpoints are in memory
+        # Verify core checkpoints are preloaded in memory
+        self.assertIn("ckpt_N40000", web_app.engine._ckpt_cache)
         self.assertIn("ckpt_N10000", web_app.engine._ckpt_cache)
         self.assertIn("ckpt_N10000_extreme", web_app.engine._ckpt_cache)
 
@@ -142,7 +143,8 @@ class TestPhases1To6(unittest.TestCase):
             self.assertEqual(res.status_code, 200, f"Failed on {fname}: {res.text}")
             job_id = res.json()["job_id"]
             poll = None
-            for _ in range(100):
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
                 poll = self.client.get(f"/api/jobs/{job_id}").json()
                 if poll["status"] in ("done", "error", "cancelled"):
                     break

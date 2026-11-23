@@ -8,6 +8,7 @@ and connected-component event consolidation (`report.py`).
 """
 from __future__ import annotations
 
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import json
@@ -24,8 +25,20 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from routers.auth import router as auth_router
+from routers.chat import router as chat_router
+from routers.runs import router as runs_router
 from schemas import FeedbackAnnotation, InferenceConfig, InferenceResponse
 from services.benchmarks import load_benchmark_summaries
+from services.chat import load_env_file
+from services.db import (
+    get_run_by_any_id,
+    get_run_for_user,
+    get_user_by_session,
+    init_db,
+    save_run,
+)
+from services.self_train import request_shutdown as request_self_train_shutdown, retrain_on_user_input
 from services.fasta_utils import (
     MAX_UPLOAD_BYTES,
     AlignmentValidationError,
@@ -40,12 +53,14 @@ from services.inference_adapter import PRESET_REGISTRY, GTTransformerInferenceEn
 from services.timing import TimingHistoryStore
 
 HERE = Path(__file__).resolve().parent
+load_env_file(HERE / ".env")
 STATIC_DIR = HERE / "static"
 TEMPLATES_DIR = HERE / "templates"
 ANNOTATIONS_PATH = HERE / "reviewer_annotations.json"
 
 logger = logging.getLogger("uvicorn.error")
 
+init_db()
 timing_store = TimingHistoryStore(log_path=str(HERE / "timing_history.json"))
 engine = GTTransformerInferenceEngine(timing_store=timing_store)
 
@@ -61,6 +76,7 @@ logger.info(
 JOB_RETENTION_SECONDS = 3600.0
 MAX_ACTIVE_JOBS = 6  # 1 running + 5 queued
 _JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gt_infer_worker")
+_RETRAIN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gt_retrain_worker")
 _JOBS_LOCK = threading.Lock()
 _JOBS: dict[str, dict[str, Any]] = {}
 
@@ -78,11 +94,26 @@ def _prune_expired_jobs(now: Optional[float] = None) -> None:
         _JOBS.pop(jid, None)
 
 
+def _shutdown_executors() -> None:
+    request_self_train_shutdown()
+    for ex in (_JOB_EXECUTOR, _RETRAIN_EXECUTOR):
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_executors)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
     if not engine.is_warmed_up:
         engine.warmup("ckpt_N10000")
-    yield
+    try:
+        yield
+    finally:
+        _shutdown_executors()
 
 
 app = FastAPI(
@@ -95,6 +126,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 server = app
+app.state.engine = engine
+app.include_router(auth_router)
+app.include_router(runs_router)
+app.include_router(chat_router)
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
 
 
 @app.exception_handler(AlignmentValidationError)
@@ -157,6 +201,26 @@ async def index() -> FileResponse:
     return FileResponse(str(index_file), headers={"Cache-Control": "no-store, max-age=0"})
 
 
+@app.get("/privacy", response_class=HTMLResponse)
+@app.get("/privacy-policy", response_class=HTMLResponse)
+async def privacy_policy() -> FileResponse:
+    """Serve the Privacy Policy page (used for Google OAuth consent screen compliance)."""
+    page = TEMPLATES_DIR / "privacy.html"
+    if not page.exists():
+        raise HTTPException(status_code=404, detail="Privacy policy page not found.")
+    return FileResponse(str(page), headers={"Cache-Control": "no-store, max-age=0"})
+
+
+@app.get("/terms", response_class=HTMLResponse)
+@app.get("/terms-of-service", response_class=HTMLResponse)
+async def terms_of_service() -> FileResponse:
+    """Serve the Terms of Service page."""
+    page = TEMPLATES_DIR / "terms.html"
+    if not page.exists():
+        raise HTTPException(status_code=404, detail="Terms of service page not found.")
+    return FileResponse(str(page), headers={"Cache-Control": "no-store, max-age=0"})
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
     """Deployment health check returning 200 once the model is loaded."""
@@ -200,15 +264,82 @@ async def get_benchmarks() -> dict[str, Any]:
     return load_benchmark_summaries()
 
 
+def _hydrate_alignment_if_needed(request: Request, run_id: str) -> None:
+    with engine._alignment_cache_lock:
+        if run_id in engine._alignment_cache:
+            return
+    user = get_user_by_session(request.cookies.get("recomb_session"))
+    try:
+        saved = get_run_by_any_id(run_id, user)
+    except PermissionError as pexc:
+        raise HTTPException(status_code=403, detail=str(pexc)) from pexc
+    if saved is not None:
+        null_policy = saved.get("result", {}).get("config", {}).get("null_policy", "duplicate")
+        engine.hydrate_alignment_cache(run_id, saved["fasta_text"], null_policy=null_policy)
+
+
 @app.get("/api/alignment/window")
 async def get_alignment_window(
+    request: Request,
     run_id: str,
     start: int = 0,
     width: int = 110,
 ) -> dict[str, Any]:
     """Return a real nucleotide window slice and informative-site flags for the alignment viewer."""
+    _hydrate_alignment_if_needed(request, run_id)
     try:
         return engine.get_alignment_window(run_id=run_id, start_bp=start, width=width)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/alignment/region-stats")
+async def get_alignment_region_stats(
+    request: Request,
+    run_id: str,
+    start_bp: int,
+    end_bp: int,
+    ref_seq_idx: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return nucleotide diversity and inside-vs-outside pairwise identity for a selected alignment region."""
+    _hydrate_alignment_if_needed(request, run_id)
+    try:
+        return engine.get_region_stats(
+            run_id=run_id,
+            start_bp=start_bp,
+            end_bp=end_bp,
+            ref_seq_idx=ref_seq_idx,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/alignment/simplot")
+async def get_alignment_simplot(
+    request: Request,
+    run_id: str,
+    query_seq_idx: int = 0,
+    window_bp: int = 100,
+    step_bp: int = 20,
+    max_refs: int = 8,
+    priority_seqs: str = "",
+) -> dict[str, Any]:
+    """Return vectorized sliding-window pairwise identity curves against candidate parental sequences."""
+    _hydrate_alignment_if_needed(request, run_id)
+    pri_list: list[int] = []
+    for tok in priority_seqs.split(","):
+        t = tok.strip()
+        if t.lstrip("-").isdigit():
+            pri_list.append(int(t))
+    try:
+        return engine.get_simplot_profile(
+            run_id=run_id,
+            query_seq_idx=query_seq_idx,
+            window_bp=window_bp,
+            step_bp=step_bp,
+            max_refs=max_refs,
+            priority_seq_idxs=pri_list or None,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -226,6 +357,7 @@ async def _parse_request_inputs(
     tf_logit_thresh: float,
     merge_radius_bp: int,
     eval_tolerance_bp: int,
+    use_mirror_tta: bool,
     pasted_fasta: Optional[str],
     pasted_gt: Optional[str],
     fasta_file: Optional[UploadFile],
@@ -254,6 +386,11 @@ async def _parse_request_inputs(
         tf_logit_thresh = float(body.get("tf_logit_thresh", tf_logit_thresh))
         merge_radius_bp = int(body.get("merge_radius_bp", merge_radius_bp))
         eval_tolerance_bp = int(body.get("eval_tolerance_bp", eval_tolerance_bp))
+        raw_tta = body.get("use_mirror_tta", use_mirror_tta)
+        if isinstance(raw_tta, str):
+            use_mirror_tta = raw_tta.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            use_mirror_tta = bool(raw_tta)
         fasta_text = body.get("fasta_text") or body.get("pasted_fasta")
         if "fasta_text" in body or "pasted_fasta" in body:
             has_upload = True
@@ -311,6 +448,7 @@ async def _parse_request_inputs(
         tf_logit_thresh=tf_logit_thresh,
         merge_radius_bp=merge_radius_bp,
         eval_tolerance_bp=eval_tolerance_bp,
+        use_mirror_tta=use_mirror_tta,
     )
     return cfg, preset_id, fasta_text, fasta_filename, gt_text, gt_filename
 
@@ -323,6 +461,7 @@ def _run_job_worker(
     fasta_filename: Optional[str],
     gt_text: Optional[str],
     gt_filename: Optional[str],
+    user: Optional[dict[str, Any]] = None,
 ) -> None:
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
@@ -362,6 +501,7 @@ def _run_job_worker(
             strict_phase2=True,
         )
         logger.info("Job %s completed: %s", job_id, res.timings.stage_summary_line)
+        res_dict = res.model_dump()
         with _JOBS_LOCK:
             j = _JOBS.get(job_id)
             if j is not None:
@@ -372,8 +512,18 @@ def _run_job_worker(
                 else:
                     j["status"] = "done"
                     j["stage"] = "done"
-                    j["result"] = res.model_dump()
+                    j["result"] = res_dict
                 j["finished_at"] = time.time()
+
+        # Persist every run to SQLite and continuously self-train ONLY on user-submitted FASTAs
+        try:
+            if fasta_text is not None:
+                save_run(job_id, user, "upload", fasta_text, res_dict)
+                _RETRAIN_EXECUTOR.submit(retrain_on_user_input, engine, job_id, fasta_text, res_dict)
+            else:
+                save_run(job_id, user, "preset", f"# preset:{preset_id}", res_dict)
+        except RuntimeError:
+            pass
     except InterruptedError:
         with _JOBS_LOCK:
             j = _JOBS.get(job_id)
@@ -397,7 +547,7 @@ def _run_job_worker(
 async def create_job_endpoint(
     request: Request,
     preset_id: Optional[str] = Form(default=None),
-    checkpoint: str = Form(default="ckpt_N10000"),
+    checkpoint: str = Form(default="ckpt_N40000"),
     scoring_mode: str = Form(default="hybrid_flank"),
     null_policy: str = Form(default="duplicate"),
     flank_window: int = Form(default=250),
@@ -407,6 +557,7 @@ async def create_job_endpoint(
     tf_logit_thresh: float = Form(default=0.8),
     merge_radius_bp: int = Form(default=75),
     eval_tolerance_bp: int = Form(default=30),
+    use_mirror_tta: bool = Form(default=False),
     pasted_fasta: Optional[str] = Form(default=None),
     pasted_gt: Optional[str] = Form(default=None),
     fasta_file: Optional[UploadFile] = File(default=None),
@@ -427,6 +578,7 @@ async def create_job_endpoint(
             tf_logit_thresh=tf_logit_thresh,
             merge_radius_bp=merge_radius_bp,
             eval_tolerance_bp=eval_tolerance_bp,
+            use_mirror_tta=use_mirror_tta,
             pasted_fasta=pasted_fasta,
             pasted_gt=pasted_gt,
             fasta_file=fasta_file,
@@ -451,6 +603,7 @@ async def create_job_endpoint(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    user = get_user_by_session(request.cookies.get("recomb_session"))
     now_ts = time.time()
     with _JOBS_LOCK:
         _prune_expired_jobs(now_ts)
@@ -461,6 +614,7 @@ async def create_job_endpoint(
         job_id = uuid.uuid4().hex[:12]
         _JOBS[job_id] = {
             "job_id": job_id,
+            "owner_id": user["id"] if user else None,
             "status": "queued",
             "stage": "queued",
             "created_at": now_ts,
@@ -480,19 +634,38 @@ async def create_job_endpoint(
         fasta_filename,
         gt_text,
         gt_filename,
+        user,
     )
     return {"job_id": job_id, "status": "queued", "stage": "queued"}
 
 
 @app.get("/api/jobs/{job_id}")
-async def get_job_status(job_id: str) -> dict[str, Any]:
+async def get_job_status(job_id: str, request: Request) -> dict[str, Any]:
     """Return status, live stage, elapsed seconds, and result/error for a background job."""
+    user = get_user_by_session(request.cookies.get("recomb_session"))
     now_ts = time.time()
     with _JOBS_LOCK:
         _prune_expired_jobs(now_ts)
         job = _JOBS.get(job_id)
         if job is None:
+            # Fallback to persistent SQLite store if job expired from memory
+            if user is not None:
+                try:
+                    saved = get_run_for_user(job_id, user)
+                    if saved is not None:
+                        return {
+                            "job_id": job_id,
+                            "status": "done",
+                            "stage": "done",
+                            "elapsed_s": round(float(saved["total_ms"]) / 1000.0, 2),
+                            "result": saved["result"],
+                        }
+                except PermissionError as exc:
+                    raise HTTPException(status_code=403, detail=str(exc)) from exc
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found or expired.")
+        owner_id = job.get("owner_id")
+        if owner_id is not None and (user is None or (user["id"] != owner_id and user["role"] != "admin")):
+            raise HTTPException(status_code=403, detail="Private job belongs to another account.")
         t_ref = job["started_at"] or job["created_at"]
         t_end = job["finished_at"] or now_ts
         elapsed_s = round(max(0.0, float(t_end - t_ref)), 2)
@@ -515,6 +688,20 @@ async def cancel_job(job_id: str) -> dict[str, Any]:
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         if job is None:
+            # Fallback to persistent SQLite store if job expired from memory
+            if user is not None:
+                try:
+                    saved = get_run_for_user(job_id, user)
+                    if saved is not None:
+                        return {
+                            "job_id": job_id,
+                            "status": "done",
+                            "stage": "done",
+                            "elapsed_s": round(float(saved["total_ms"]) / 1000.0, 2),
+                            "result": saved["result"],
+                        }
+                except PermissionError as exc:
+                    raise HTTPException(status_code=403, detail=str(exc)) from exc
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found or expired.")
         job["cancel_requested"] = True
         if job["status"] == "queued":
@@ -529,7 +716,7 @@ async def cancel_job(job_id: str) -> dict[str, Any]:
 async def run_inference_endpoint(
     request: Request,
     preset_id: Optional[str] = Form(default=None),
-    checkpoint: str = Form(default="ckpt_N10000"),
+    checkpoint: str = Form(default="ckpt_N40000"),
     scoring_mode: str = Form(default="hybrid_flank"),
     null_policy: str = Form(default="duplicate"),
     flank_window: int = Form(default=250),
@@ -539,6 +726,7 @@ async def run_inference_endpoint(
     tf_logit_thresh: float = Form(default=0.8),
     merge_radius_bp: int = Form(default=75),
     eval_tolerance_bp: int = Form(default=30),
+    use_mirror_tta: bool = Form(default=False),
     pasted_fasta: Optional[str] = Form(default=None),
     pasted_gt: Optional[str] = Form(default=None),
     fasta_file: Optional[UploadFile] = File(default=None),
@@ -559,6 +747,7 @@ async def run_inference_endpoint(
             tf_logit_thresh=tf_logit_thresh,
             merge_radius_bp=merge_radius_bp,
             eval_tolerance_bp=eval_tolerance_bp,
+            use_mirror_tta=use_mirror_tta,
             pasted_fasta=pasted_fasta,
             pasted_gt=pasted_gt,
             fasta_file=fasta_file,

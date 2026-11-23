@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 class InferenceConfig(BaseModel):
     """Configuration parameters for running a live GT-Transformer inference job."""
     checkpoint: str = Field(
-        default="ckpt_N10000",
+        default="ckpt_N40000",
         description="Trained model checkpoint identifier.",
     )
     scoring_mode: Literal["hybrid_flank", "standalone_tf", "flank_kl", "global_kl"] = Field(
@@ -67,6 +67,10 @@ class InferenceConfig(BaseModel):
         ge=0,
         le=200,
         description="Primary bp tolerance window (±k bp) for TP/FP/FN ground-truth evaluation.",
+    )
+    use_mirror_tta: bool = Field(
+        default=False,
+        description="Run bidirectional forward + reverse-alignment Mirror TTA and average boundary logits for higher precision & AUPRC.",
     )
 
 
@@ -135,6 +139,7 @@ class RecombinantCall(BaseModel):
 class ConsolidatedEvent(BaseModel):
     """Level 1: Consolidated breakpoint event with Level 2/3 carrier & parent details."""
     event_id: int
+    ancestral_event_id: int = 1
     most_plausible_bp_orig: int
     span_orig_start: int
     span_orig_end: int
