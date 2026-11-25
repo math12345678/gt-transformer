@@ -3,19 +3,24 @@ Empirical Adversarial Stress Testing Harness for Milestone 3 Gate Verification.
 
 Tests all mandated edge cases and boundaries against BOTH:
 1. In-process FastAPI TestClient(web_app.app)
-2. Live running HTTP server at http://127.0.0.1:8050/api/infer
+2. A live HTTP server started by the test on an available local port
 """
 from __future__ import annotations
 
 import io
 import json
+import socket
+from concurrent.futures import ThreadPoolExecutor
 import sys
+import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import uvicorn
 
 WEB_DIR = Path(__file__).resolve().parents[1]
 if str(WEB_DIR) not in sys.path:
@@ -69,6 +74,38 @@ class TestChallengerM3Stress(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.client = TestClient(web_app.app)
         web_app.engine.warmup("ckpt_N10000_extreme")
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+
+        global LIVE_SERVER_URL
+        LIVE_SERVER_URL = f"http://127.0.0.1:{port}/api/infer"
+        config = uvicorn.Config(web_app.app, host="127.0.0.1", port=port, log_level="error")
+        cls._server = uvicorn.Server(config)
+        cls._thread = threading.Thread(target=cls._server.run, daemon=True)
+        cls._thread.start()
+
+        health_url = f"http://127.0.0.1:{port}/healthz"
+        for _ in range(100):
+            try:
+                with urllib.request.urlopen(health_url, timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("Live test server did not start")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._server.should_exit = True
+        cls._thread.join(timeout=10)
+        # uvicorn shutdown closes the app-wide executors; restore them so other
+        # test modules can keep submitting jobs in the same process.
+        web_app._JOB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gt_infer_worker")
+        web_app._RETRAIN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gt_retrain_worker")
 
     # =========================================================================
     # BATTERY 1: Malformed Inputs & HTTP Status Codes (Client & Live HTTP)

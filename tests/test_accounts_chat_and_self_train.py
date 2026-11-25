@@ -833,7 +833,7 @@ class TestAccountsChatAndSelfTrain(unittest.TestCase):
         cons_same = REP.consolidate_peaks(raw_same, merge_radius_bp=75)
         self.assertEqual(len(cons_same), 1, cons_same)
 
-        edge60 = Path(__file__).resolve().parents[4] / "martin-web-test" / "04_EDGE_short_tract_60bp.fasta"
+        edge60 = Path(__file__).resolve().parents[1] / "fixtures" / "04_EDGE_short_tract_60bp.fasta"
         if edge60.exists():
             res_short = web_app.engine.run_inference(
                 InferenceConfig(checkpoint="ckpt_N10000", scoring_mode="flank_kl"),

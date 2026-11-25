@@ -4,7 +4,7 @@ Comprehensive Verification Test Suite for Phases 1 through 6:
   - Phase 2: validate_alignment(records) exact error messages (09a-09h), formatting variants (08a-08e), size caps (20 MB, 500 seqs, 50,000 cols)
   - Phase 3: Accuracy on 01_main_8seq_1500bp.fasta (4/4 TP within ±6 bp, 0 FP, exact carriers R1_rec/R2_rec, exact parents P1/P2/P3/P4)
   - Phase 4: Per-stage timing summary line and timings.csv verification
-  - Phase 5 & 6: /healthz endpoint, Dockerfile, fly.toml, and "How to use" guide panel
+  - Phase 5 & 6: /healthz endpoint, Dockerfile, README, and "How to use" guide panel
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 WEB_DIR = Path(__file__).resolve().parents[1]
-REPO_ROOT = WEB_DIR.parents[2]
+FIXTURES_DIR = WEB_DIR / "tests" / "fixtures"
 if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
 
@@ -28,7 +28,7 @@ class TestPhases1To6(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.client = TestClient(web_app.app)
-        cls.suite_dir = REPO_ROOT / "martin-web-test"
+        cls.suite_dir = FIXTURES_DIR
 
     def test_01_index_html_empty_state_and_how_to_use(self) -> None:
         res = self.client.get("/")
@@ -207,8 +207,8 @@ class TestPhases1To6(unittest.TestCase):
             self.assertIn(col, rows[0])
 
         self.assertTrue((WEB_DIR / "Dockerfile").is_file())
-        self.assertTrue((WEB_DIR / "fly.toml").is_file())
-        self.assertTrue((WEB_DIR / "RESULTS_v2.md").is_file())
+        self.assertTrue((WEB_DIR / "README.md").is_file())
+        self.assertTrue((WEB_DIR / "index.html").is_file())
 
 
 if __name__ == "__main__":

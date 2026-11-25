@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 from schemas import InferenceTimingReport, StageTiming
+from services import db as db_store
 
 
 class TimingRecorder:
@@ -165,10 +166,15 @@ class TimingHistoryStore:
     def __init__(self, log_path: Optional[str] = None) -> None:
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.log_path = log_path or os.path.join(here, "timing_history.json")
+        self._use_db = db_store.uses_postgres()
         self._records: list[InferenceTimingReport] = []
         self._load()
 
     def _load(self) -> None:
+        if self._use_db:
+            raw = db_store.list_timing_reports(150)
+            self._records = [InferenceTimingReport(**item) for item in raw]
+            return
         if not os.path.exists(self.log_path):
             self._records = []
             return
@@ -185,6 +191,8 @@ class TimingHistoryStore:
             self._records = []
 
     def _save(self) -> None:
+        if self._use_db:
+            return
         try:
             with open(self.log_path, "w", encoding="utf-8") as fh:
                 json.dump([r.model_dump() for r in self._records], fh, indent=2)
@@ -194,7 +202,10 @@ class TimingHistoryStore:
     def record(self, report: InferenceTimingReport) -> None:
         self._records.insert(0, report)
         self._records = self._records[:150]
-        self._save()
+        if self._use_db:
+            db_store.append_timing_report(report.model_dump())
+        else:
+            self._save()
 
     def list_history(self) -> list[InferenceTimingReport]:
         return list(self._records)

@@ -1,10 +1,15 @@
-"""SQLite database for private user accounts, sessions, user runs, admin collection, and self-training logs."""
+"""Persistent store for private accounts, sessions, runs, timings and annotations.
+
+Uses Supabase Postgres when ``SUPABASE_DB_DSN`` (or ``DATABASE_URL``) is set,
+and falls back to a local SQLite file for offline development and tests.
+"""
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -16,7 +21,107 @@ DB_PATH = Path(__file__).resolve().parents[1] / "recomb_app.db"
 _DB_LOCK = threading.Lock()
 
 
-def _connect() -> sqlite3.Connection:
+def _dsn() -> str:
+    return os.environ.get("SUPABASE_DB_DSN") or os.environ.get("DATABASE_URL") or ""
+
+
+def uses_postgres() -> bool:
+    return bool(_dsn())
+
+
+# ---------------------------------------------------------------------------
+# Minimal psycopg adapter: the original SQLite call sites stay unchanged.
+# ---------------------------------------------------------------------------
+_INSERT_OR_REPLACE = re.compile(
+    r"^\s*INSERT\s+OR\s+REPLACE\s+INTO\s+([\w.]+)\s*\(([^)]*)\)\s*VALUES\s*(\([^)]*\))\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _pg_sql(sql: str) -> str:
+    """Convert the small subset of SQLite SQL used here into Postgres SQL."""
+    sql = re.sub(r"\?", "%s", sql)
+    sql = re.sub(r"\bAUTOINCREMENT\b", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\b", "SERIAL PRIMARY KEY", sql, flags=re.IGNORECASE)
+    match = _INSERT_OR_REPLACE.match(sql)
+    if match:
+        table, columns_raw, values = match.groups()
+        columns = [c.strip() for c in columns_raw.split(",")]
+        conflict = "id" if "id" in columns else columns[0]
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c != conflict)
+        sql = (
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES {values} "
+            f"ON CONFLICT ({conflict}) DO UPDATE SET {updates}"
+        )
+    return sql
+
+
+class _PgResult:
+    def __init__(self, cursor: Any, lastrowid: int = 0) -> None:
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+
+    def fetchone(self) -> Optional[dict[str, Any]]:
+        if self._cursor is None:
+            return None
+        row = self._cursor.fetchone()
+        return _pg_dict(row, self._cursor.description) if row is not None else None
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        if self._cursor is None:
+            return []
+        return [_pg_dict(row, self._cursor.description) for row in self._cursor.fetchall()]
+
+
+def _pg_dict(row: Any, description: Any) -> dict[str, Any]:
+    return {col.name: row[idx] for idx, col in enumerate(description)}
+
+
+class _PgConnection:
+    """Thin psycopg wrapper exposing the few sqlite3 methods this module uses."""
+
+    def __init__(self, dsn: str) -> None:
+        import psycopg
+
+        self._conn = psycopg.connect(dsn, connect_timeout=15)
+
+    def execute(self, sql: str, params: Any = ()) -> _PgResult:
+        if sql.strip().upper().startswith("PRAGMA"):
+            return _PgResult(None)
+        sql = _pg_sql(sql)
+        # Serial-id inserts need their generated id; RETURNING avoids a second
+        # statement (and avoids aborting the transaction with lastval()).
+        wants_id = bool(
+            re.match(r"^\s*INSERT\s+INTO\s+(users|reviewer_annotations)\b", sql, re.IGNORECASE)
+            and "ON CONFLICT" not in sql.upper()
+            and "RETURNING" not in sql.upper()
+        )
+        if wants_id:
+            sql = sql.rstrip() + " RETURNING id"
+        cursor = self._conn.execute(sql, tuple(params or ()))
+        lastrowid = 0
+        if wants_id:
+            row = cursor.fetchone()
+            if row is not None:
+                lastrowid = int(row[0])
+        return _PgResult(cursor, lastrowid)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if statement and not statement.upper().startswith("PRAGMA"):
+                self._conn.execute(_pg_sql(statement))
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def _connect() -> Any:
+    if uses_postgres():
+        return _PgConnection(_dsn())
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -39,81 +144,100 @@ def _verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(expected, dk_hex)
 
 
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    email TEXT DEFAULT '',
+    auth_provider TEXT NOT NULL DEFAULT 'local',
+    google_sub TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runs (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    username TEXT NOT NULL DEFAULT 'anonymous',
+    dataset_name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    fasta_text TEXT NOT NULL,
+    checkpoint TEXT NOT NULL,
+    scoring_mode TEXT NOT NULL,
+    n_sequences INTEGER NOT NULL,
+    genome_length_bp INTEGER NOT NULL,
+    n_events INTEGER NOT NULL,
+    total_ms REAL NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    timings_run_id TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS retrain_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    dataset_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    loss_before REAL,
+    loss_after REAL,
+    steps INTEGER NOT NULL DEFAULT 0,
+    n_positive INTEGER NOT NULL DEFAULT 0,
+    n_negative INTEGER NOT NULL DEFAULT 0,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS timing_history (
+    run_id TEXT PRIMARY KEY,
+    timestamp_iso TEXT NOT NULL,
+    report_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reviewer_annotations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runs_user_created ON runs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_timings_run_id ON runs(timings_run_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_retrain_run ON retrain_log(run_id);
+CREATE INDEX IF NOT EXISTS idx_timing_created ON timing_history(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_annotations_created ON reviewer_annotations(created_at DESC);
+"""
+
+_PG_MIGRATIONS_SQL = """
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT DEFAULT '';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS timings_run_id TEXT DEFAULT '';
+"""
+
+
 def init_db() -> None:
     """Create tables if missing and seed the admin account from environment variables."""
     with _DB_LOCK:
         conn = _connect()
         try:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    role TEXT NOT NULL DEFAULT 'user',
-                    email TEXT DEFAULT '',
-                    auth_provider TEXT NOT NULL DEFAULT 'local',
-                    google_sub TEXT DEFAULT '',
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS sessions (
-                    token TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS runs (
-                    id TEXT PRIMARY KEY,
-                    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                    username TEXT NOT NULL DEFAULT 'anonymous',
-                    dataset_name TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    fasta_text TEXT NOT NULL,
-                    checkpoint TEXT NOT NULL,
-                    scoring_mode TEXT NOT NULL,
-                    n_sequences INTEGER NOT NULL,
-                    genome_length_bp INTEGER NOT NULL,
-                    n_events INTEGER NOT NULL,
-                    total_ms REAL NOT NULL,
-                    result_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    timings_run_id TEXT DEFAULT ''
-                );
-                CREATE TABLE IF NOT EXISTS retrain_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    dataset_name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    loss_before REAL,
-                    loss_after REAL,
-                    steps INTEGER NOT NULL DEFAULT 0,
-                    n_positive INTEGER NOT NULL DEFAULT 0,
-                    n_negative INTEGER NOT NULL DEFAULT 0,
-                    notes TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL
-                );
-                """
-            )
-            # Safe schema migrations for existing DBs
-            cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
-            if "email" not in cols:
-                conn.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
-            if "auth_provider" not in cols:
-                conn.execute("ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local'")
-            if "google_sub" not in cols:
-                conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT DEFAULT ''")
-            run_cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
-            if "timings_run_id" not in run_cols:
-                conn.execute("ALTER TABLE runs ADD COLUMN timings_run_id TEXT DEFAULT ''")
-
-            conn.executescript(
-                """
-                CREATE INDEX IF NOT EXISTS idx_runs_user_created ON runs(user_id, created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_runs_timings_run_id ON runs(timings_run_id);
-                CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
-                CREATE INDEX IF NOT EXISTS idx_retrain_run ON retrain_log(run_id);
-                """
-            )
+            conn.executescript(_SCHEMA_SQL)
+            if uses_postgres():
+                conn.executescript(_PG_MIGRATIONS_SQL)
+            else:
+                # Safe schema migrations for existing SQLite DBs
+                cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+                if "email" not in cols:
+                    conn.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
+                if "auth_provider" not in cols:
+                    conn.execute("ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local'")
+                if "google_sub" not in cols:
+                    conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT DEFAULT ''")
+                run_cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+                if "timings_run_id" not in run_cols:
+                    conn.execute("ALTER TABLE runs ADD COLUMN timings_run_id TEXT DEFAULT ''")
 
             admin_user = os.environ.get("ADMIN_USERNAME", "admin").strip() or "admin"
             admin_pass = os.environ.get("ADMIN_PASSWORD", "admin-recomb-2026").strip() or "admin-recomb-2026"
@@ -518,5 +642,88 @@ def record_retrain_event(
                 (run_id, dataset_name, status, loss_before, loss_after, steps, n_positive, n_negative, notes, now),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Timing history & reviewer annotations (same backend as accounts/runs)
+# ---------------------------------------------------------------------------
+def append_timing_report(report: dict[str, Any]) -> None:
+    """Store one live inference timing report, replacing a repeated run id."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO timing_history
+                (run_id, timestamp_iso, report_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    str(report.get("run_id", "")),
+                    str(report.get("timestamp_iso", now)),
+                    json.dumps(report),
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_timing_reports(limit: int = 150) -> list[dict[str, Any]]:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT report_json FROM timing_history
+                ORDER BY created_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    result.append(json.loads(row["report_json"]))
+                except Exception:
+                    continue
+            return result
+        finally:
+            conn.close()
+
+
+def add_annotation(entry: dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT INTO reviewer_annotations (entry_json, created_at) VALUES (?, ?)",
+                (json.dumps(entry), now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_annotations(limit: int = 200) -> list[dict[str, Any]]:
+    with _DB_LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT entry_json FROM reviewer_annotations ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    result.append(json.loads(row["entry_json"]))
+                except Exception:
+                    continue
+            return result
         finally:
             conn.close()

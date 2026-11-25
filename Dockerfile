@@ -18,12 +18,12 @@ COPY . .
 RUN chmod -R a+rwX /app
 
 ENV HOST=0.0.0.0
-ENV PORT=8080
+ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
 ENV OMP_NUM_THREADS=2
 ENV OPENBLAS_NUM_THREADS=2
 
-EXPOSE 8080
+EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:${PORT:-8080}/healthz || exit 1

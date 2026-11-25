@@ -2,6 +2,7 @@
 .agents
 .claude
 .env
+.env.*
 *.db
 *.sqlite*
 __pycache__
@@ -21,3 +22,5 @@ build
 *.egg-info
 .coverage
 htmlcov
+index.html
+tests

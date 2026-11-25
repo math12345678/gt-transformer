@@ -1,51 +1,122 @@
----
-title: GT-Transformer Recombination Workbench
-emoji: 🧬
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 8080
-short_description: Recombination breakpoint inference and diagnostics workbench
----
+# GT-Transformer workbench
 
-# gt-transformer-web
+This repository contains the FastAPI web workbench for GT-Transformer recombination breakpoint detection. It includes the inference code, bundled model checkpoints, sample alignments, and an API-backed interface for loading a FASTA alignment, running inference, viewing results, and exporting reports.
 
-Web-accessible recombination detection and diagnostic workbench for `gt-transformer`, modeled on **RDP5** and **OpenRDP**.
+## Live workbench
 
-## Interface Layout (RDP5 / OpenRDP Design)
+- Current production site: https://gt-transformer-prod-061ed.containers.snapdeploy.app/
+- Permanent bookmark: https://math12345678.github.io/gt-transformer-web/
 
-- **Top Toolbar & Informative-Site Overview Strip** — `Open` (FASTA upload + optional `.json`/`.csv`/SantaSim `.txt` ground truth), `Run`, `Options` (OpenRDP-style `.ini` parameter dialog), dataset selector, and export buttons (`Save OpenRDP TSV`, `Save Breakpoints CSV`, `Save Sequence Calls`, `Timings CSV`, `Save JSON`).
-- **Top-Left Pane (Multiple Sequence Alignment Viewer)** — Displays actual nucleotides from the loaded FASTA with parsimony-informative sites highlighted, sequence list sidebar, coordinate jumper, and carrier/parent highlighting.
-- **Top-Right Pane (Tabbed Analysis & Diagnostics)**
-  - `Overview`: Consolidated breakpoint table (`Event #`, `Method`, `BP`, `Span`, `Peaks`, `flank_kl z`, `TF logit`, `Carriers`, `Ext Parents L→R`, `Status`).
-  - `Matrices / Parents`: Level-2 recombinant carrier switch scores (`p_switch`) and Level-3 ranked parental-like candidates.
-  - `TP / FP / FN`: Tolerant matching ($\pm 0, \pm 3, \pm 10, \pm 30\text{ bp}$) against ground truth and matched uniform random controls.
-  - `Timings`: Stage-by-stage `time.perf_counter()` latency & throughput (`bp/s`, `cols/s`) plus persistent run history.
-  - `10k Validation`: Scaling and out-of-range benchmark summaries loaded from disk (`scaling_results_summary.csv`, `out_of_range_results_summary.csv`).
-  - `Notes`: Structured diagnostic annotations per event.
-- **Bottom-Left Pane (Breakpoint Scan Plot & Side Controls)** — `flank_kl` z-score profile, permutation-null threshold band, Window Transformer probability trace, top GT/Predicted tick strips, cursor coordinate readout (`bp : z`), method/checkpoint selectors, and `Run`/`Options...` controls.
-- **Bottom-Right Pane (Mosaic Sequence Map)** — Horizontal carrier sequence bars colored by inferred left and right external parental tracts with breakpoint and confidence spans.
+The GitHub Pages address is a redirect page. It points to the current production site so that old links from the manuscript keep working.
 
-## Architecture
+## Requirements
 
-- `app.py` — FastAPI server & HTTP endpoints (`/`, `/api/health`, `/api/presets`, `/api/benchmarks`, `/api/alignment/window`, `/api/infer`, `/api/timings`, `/api/timings/export.csv`, `/api/annotations`)
-- `schemas.py` — Pydantic request/response contracts
-- `services/inference_adapter.py` — `GTTransformerInferenceEngine` wired directly to `../pipeline.py`, `../model.py`, `../train.py`, `../haldec.py`, `../report.py` and saved checkpoints (`ckpt_N10000_extreme`, `ckpt_N10000`, `ckpt_N8000`, `ckpt_N4000`, `ckpt_N2000`, `ckpt_N1000`, `ckpt/model_4x_data.pkl`)
-- `services/timing.py` — `TimingRecorder` and `TimingHistoryStore`
-- `services/fasta_utils.py` — FASTA parser and ground-truth log parser
-- `services/diagnostics.py` — Greedy closest-first tolerant matching & TP/FP/FN breakdown
-- `services/benchmarks.py` — Loader for 10,000-alignment and extreme evaluation summaries
+- Python 3.10 or newer
+- `pip`
+- Optional: Docker, if you want to run the app in a container
+- Optional: a Supabase/Postgres connection string, if you want shared persistence instead of the local SQLite file
+- Optional: an API key, if you want the AI results assistant in the web interface
 
-## Running
+## Local setup
+
+From the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Configuration is optional. To change settings, copy the example file and edit it:
+
+```bash
+cp .env.example .env
+```
+
+Never commit `.env`. It is ignored by Git and Docker.
+
+The main settings are:
+
+- `SUPABASE_DB_DSN`: Postgres connection string for shared runs and accounts. If omitted, the app creates a local `recomb_app.db` SQLite file.
+- `AI_PROVIDER` and `ANTHROPIC_API_KEY`: enable the AI assistant. `ANTHROPIC_MODEL` sets the model name.
+- `ADMIN_USERNAME` and `ADMIN_PASSWORD`: admin login for the deployed workbench.
+- `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`: optional Google sign-in.
+
+You can run the app without any of these. The assistant will simply report that it is not configured.
+
+## Run locally
 
 ```bash
 ./run_server.sh
 ```
 
-Then open `http://127.0.0.1:8050`.
+Then open http://127.0.0.1:8050.
 
-## Testing
+The health check is available at http://127.0.0.1:8050/healthz.
+
+To run on a different port:
 
 ```bash
-../.venv/bin/python -m unittest discover -s tests -v
+PORT=9000 ./run_server.sh
 ```
+
+You can also start the server directly:
+
+```bash
+python3 -m uvicorn app:app --host 127.0.0.1 --port 8050
+```
+
+## Using the workbench
+
+1. Click **Open** and choose an aligned FASTA file. You can also paste a FASTA alignment.
+   - The sequences must already be aligned to the same length.
+   - Inputs need 5 to 500 sequences and up to 50,000 columns.
+   - The upload limit is 20 MB.
+2. Use **Options** to choose the checkpoint and scoring mode if needed.
+3. Click **Run**. The job runs in the background and the interface polls for results.
+4. Use the results tabs to inspect breakpoints, parents, diagnostics, timings, and annotations.
+5. Use the export menu to download CSV, JSON, TSV, FASTA, HTML, or a complete ZIP bundle.
+
+Small example alignments are in `sample_data/`. Validation fixtures used by the tests are in `tests/fixtures/`.
+
+## Tests
+
+Install the dependencies first, then run:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The tests use the bundled checkpoints and local fixtures. They do not need API keys, a network connection, or a Supabase database.
+
+The benchmark scripts are in `scripts/`:
+
+```bash
+python3 scripts/benchmark_timings.py
+python3 scripts/build_and_run_martin_suite.py
+```
+
+These write updated timing/results files into the repository root, so only run them when you intend to regenerate those files.
+
+## Docker
+
+```bash
+docker build -t gt-transformer .
+docker run --rm -p 8050:8000 gt-transformer
+```
+
+Then open http://127.0.0.1:8050. Pass environment variables with `--env` if you need Postgres or the AI assistant.
+
+## Repository layout
+
+- `app.py` — FastAPI application and route registration
+- `routers/` — HTTP routes for runs, authentication, and chat
+- `services/` — inference adapter, database, timing, diagnostics, and chat logic
+- `gt_core/` — model, data handling, pipeline, decoding, and training code
+- `checkpoints/` — bundled model weights
+- `sample_data/` — small alignments for manual testing
+- `tests/` — unit and integration tests, plus `fixtures/`
+- `static/` and `templates/` — web interface assets
+- `index.html` — GitHub Pages redirect only
+- `scripts/` — timing and benchmark helpers
+- `Dockerfile`, `requirements.txt`, `run_server.sh` — build and run files

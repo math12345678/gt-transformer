@@ -32,10 +32,12 @@ from schemas import FeedbackAnnotation, InferenceConfig, InferenceResponse
 from services.benchmarks import load_benchmark_summaries
 from services.chat import load_env_file
 from services.db import (
+    add_annotation as db_add_annotation,
     get_run_by_any_id,
     get_run_for_user,
     get_user_by_session,
     init_db,
+    list_annotations as db_list_annotations,
     save_run,
 )
 from services.self_train import request_shutdown as request_self_train_shutdown, retrain_on_user_input
@@ -524,6 +526,8 @@ def _run_job_worker(
                 save_run(job_id, user, "preset", f"# preset:{preset_id}", res_dict)
         except RuntimeError:
             pass
+        except Exception:
+            logger.exception("Failed to persist completed run %s", job_id)
     except InterruptedError:
         with _JOBS_LOCK:
             j = _JOBS.get(job_id)
@@ -810,6 +814,9 @@ async def export_timings_csv() -> PlainTextResponse:
 
 
 def _load_annotations() -> list[dict[str, Any]]:
+    stored = db_list_annotations(200)
+    if stored:
+        return stored
     if ANNOTATIONS_PATH.exists():
         try:
             return json.loads(ANNOTATIONS_PATH.read_text(encoding="utf-8"))
@@ -831,8 +838,8 @@ async def save_annotation(annotation: FeedbackAnnotation) -> dict[str, Any]:
     items = _load_annotations()
     entry = annotation.model_dump()
     entry["created_at_iso"] = datetime.now(timezone.utc).isoformat()
+    db_add_annotation(entry)
     items.insert(0, entry)
-    ANNOTATIONS_PATH.write_text(json.dumps(items, indent=2), encoding="utf-8")
     return {"status": "saved", "annotation": entry, "total_count": len(items)}
 
 

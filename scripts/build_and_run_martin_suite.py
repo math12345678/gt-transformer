@@ -7,14 +7,13 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 import time
 from pathlib import Path
 import numpy as np
 
 WEB_DIR = Path(__file__).resolve().parents[1]
-REPO_ROOT = WEB_DIR.parents[2]
+FIXTURES_DIR = WEB_DIR / "tests" / "fixtures"
 if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
 
@@ -41,7 +40,7 @@ def wrap60(seq: str) -> str:
 
 def build_martin_suite(out_dir: Path) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
-    main_01_src = REPO_ROOT / "01_main_8seq_1500bp.fasta"
+    main_01_src = FIXTURES_DIR / "01_main_8seq_1500bp.fasta"
     if not main_01_src.exists():
         raise FileNotFoundError(f"Missing {main_01_src}")
 
@@ -267,16 +266,7 @@ def submit_and_wait_job(client: TestClient, fasta_path: Path, scoring_mode: str 
 
 
 def main() -> None:
-    suite_dir = REPO_ROOT / "martin-web-test"
-    build_martin_suite(suite_dir)
-    try:
-        tmp_suite = Path("/tmp/martin-web-test")
-        if tmp_suite.exists():
-            shutil.rmtree(tmp_suite)
-        shutil.copytree(suite_dir, tmp_suite)
-    except Exception:
-        pass
-
+    suite_dir = FIXTURES_DIR
     client = TestClient(web_app.app)
 
     test_files = [

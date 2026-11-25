@@ -18,6 +18,8 @@ venv/
 
 # Local runtime state & logs
 .env
+.env.*
+!.env.example
 recomb_app.db
 checkpoints/ckpt_user_adaptive/
 timing_history.json
@@ -30,6 +32,9 @@ build/
 *.egg-info/
 .coverage
 htmlcov/
+*.dmg
+*.exe
+*.app/
 
 # IDE & OS
 .vscode/

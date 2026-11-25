@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openrdp-web"
+name = "gt-transformer-web"
 version = "2.0.0"
-description = "GT-Transformer / OpenRDP Web Interface for Recombination Detection"
+description = "GT-Transformer recombination detection workbench"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,10 +17,11 @@ dependencies = [
     "numpy>=1.26.0",
     "jax>=0.4.25",
     "jaxlib>=0.4.25",
+    "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]
-openrdp-web = "cli:main"
+gt-transformer-web = "cli:main"
 
 [tool.setuptools]
 py-modules = ["app", "schemas", "cli"]

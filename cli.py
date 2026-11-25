@@ -1,5 +1,5 @@
 """
-CLI launcher (`openrdp-web`) for local installation of the GT-Transformer / OpenRDP Web Interface.
+CLI launcher (`gt-transformer-web`) for local installation of the GT-Transformer workbench.
 Starts uvicorn on 127.0.0.1:8765 (or custom --host / --port), verifies checkpoint SHA256 hashes,
 and opens the default browser once `/healthz` responds HTTP 200.
 """

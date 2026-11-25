@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 WEB_DIR = Path(__file__).resolve().parents[1]
-REPO_ROOT = WEB_DIR.parents[2]
+FIXTURES_DIR = WEB_DIR / "tests" / "fixtures"
 if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
 
@@ -27,11 +27,11 @@ from schemas import InferenceConfig  # noqa: E402
 
 
 def main() -> None:
-    suite_dir = REPO_ROOT / "martin-web-test"
+    suite_dir = FIXTURES_DIR
     targets = [
         ("01_main_8seq_1500bp.fasta", suite_dir / "01_main_8seq_1500bp.fasta", None),
         ("03_null_6seq_1200bp.fasta", suite_dir / "03_null_6seq_1200bp.fasta", None),
-        ("07_scale_60seq_3000bp.fasta", suite_dir / "07_scale_60seq_3000bp.fasta", None),
+        ("07_SCALE_60seq_3000bp.fasta", suite_dir / "07_SCALE_60seq_3000bp.fasta", None),
         ("d005_L3536_s96_r001.fas", None, "d005_L3536_s96_r001"),
     ]
 
@@ -87,18 +87,14 @@ def main() -> None:
         "total_s",
         "median_total_s",
     ]
-    out_paths = [
-        WEB_DIR / "timings.csv",
-        REPO_ROOT / "timings.csv",
-        suite_dir / "timings.csv",
-    ]
+    out_paths = [WEB_DIR / "timings.csv"]
     for out_csv in out_paths:
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         with out_csv.open("w", encoding="utf-8", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(all_rows)
-    print(f"Wrote timings.csv ({len(all_rows)} rows) to {out_paths[0]} and {out_paths[1]}")
+    print(f"Wrote timings.csv ({len(all_rows)} rows) to {out_paths[0]}")
 
 
 if __name__ == "__main__":
