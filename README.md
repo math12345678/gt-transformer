@@ -9,6 +9,23 @@ Unified repository for **GT-Transformer**: both the front-facing React/Three.js 
 
 All launch links in the landing UI point directly to the live workbench, while pushes to `main` automatically build and deploy `frontend/` to GitHub Pages via `.github/workflows/pages.yml`.
 
+## Downloads
+
+The landing-page download buttons point to these permanent release files:
+
+- **macOS app (Apple Silicon .dmg):** https://github.com/math12345678/gt-transformer/releases/download/v1.0.0-website/GT-Transformer-macOS-arm64.dmg
+- **Windows installer (.exe):** https://github.com/math12345678/gt-transformer/releases/download/v1.0.0-website/GT-Transformer-Windows-x86_64.exe
+- **recombx CLI (.zip):** https://github.com/math12345678/gt-transformer/releases/download/v1.0.0-website/recombx-cli.zip
+- **Checksums:** https://github.com/math12345678/gt-transformer/releases/download/v1.0.0-website/SHA256SUMS.txt
+
+The CLI zip contains a small Python script that calls the live workbench. Unzip it and run:
+
+```bash
+./recombx detect --mode hybrid --permutations 48 --format json alignment.fasta
+```
+
+The script needs Python 3.10+ and an internet connection. It wakes the free-tier workbench automatically if the service is asleep.
+
 ## Requirements
 
 - **Backend / Workbench:** Python 3.10+ and `pip` (optional: Docker; optional: Supabase/Postgres DSN; optional: AI assistant API key)
@@ -102,6 +119,7 @@ Frontend source (`frontend/`) and workflow files (`.github/`) are excluded via `
 - `services/` — Inference adapter, SQLite/Postgres persistence, timings, diagnostics, and assistant logic
 - `gt_core/` — Core pipeline, Two-Site Window Transformer, Flanking-KL scanner, HalDec consolidator, and training modules
 - `checkpoints/` — Bundled `params.pkl` checkpoints (`ckpt_N40000`, `ckpt_N10000`, `ckpt_N10000_extreme`, `ckpt_N10000_v2`)
+- `scripts/recombx` — Standard-library CLI client for the live workbench
 - `benchmark_data/` — Published scaling & cross-rate summary JSON/CSV files
 - `sample_data/` — Example viral alignments (`sarbecovirus_aligned.fasta`, `ULTIMATE_STRESS_TEST_64seq_12000bp.fasta`, etc.)
 - `tests/` — Unit/integration tests and validation `fixtures/`

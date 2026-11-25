@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""recombx - command-line client for the hosted GT-Transformer workbench.
+
+The script uses only the Python standard library. It uploads an aligned FASTA
+file to the live workbench, waits for a sleeping free-tier container to wake if
+needed, and prints the workbench result in JSON, TSV, or a short summary.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Any
+
+DEFAULT_SERVER = "https://gt-transformer-prod-061ed.containers.snapdeploy.app"
+WAKE_API = "https://snapdeploy.dev/api/public/wake"
+
+MODE_MAP = {
+    "hybrid": "hybrid_flank",
+    "hybrid_flank": "hybrid_flank",
+    "tf": "standalone_tf",
+    "standalone_tf": "standalone_tf",
+    "flank_kl": "flank_kl",
+    "global_kl": "global_kl",
+}
+
+
+class CLIError(RuntimeError):
+    """A user-facing error from the CLI."""
+
+
+def _http_error_body(exc: urllib.error.HTTPError) -> str:
+    try:
+        raw = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        raw = ""
+    if not raw:
+        return f"HTTP {exc.code} {exc.reason}"
+    if len(raw) > 800:
+        raw = raw[:800] + "..."
+    return raw
+
+
+def _is_sleeping_page(body: str) -> bool:
+    lowered = body.lower()
+    return "container is sleeping" in lowered or "waking up your container" in lowered
+
+
+def _wake_if_needed(server: str, timeout: int) -> bool:
+    """Wake a sleeping SnapDeploy container and wait until /healthz is healthy."""
+    host = urllib.parse.urlparse(server).hostname or ""
+    if not host.endswith(".containers.snapdeploy.app"):
+        return False
+
+    subdomain = host.split(".")[0]
+    if not subdomain:
+        return False
+
+    wake_url = f"{WAKE_API}/{urllib.parse.quote(subdomain)}"
+    wake_request = urllib.request.Request(
+        wake_url,
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(wake_request, timeout=30) as response:
+            response.read()
+    except Exception as exc:
+        print(f"recombx: could not request wake-up: {exc}", file=sys.stderr)
+        return False
+
+    print(f"recombx: waiting for {subdomain} to finish waking up...", file=sys.stderr)
+    deadline = time.monotonic() + min(timeout, 240)
+    health_url = server.rstrip("/") + "/healthz"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(health_url, method="GET"), timeout=10
+            ) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                if response.status == 200 and not _is_sleeping_page(body):
+                    print("recombx: workbench is ready.", file=sys.stderr)
+                    return True
+        except urllib.error.HTTPError as exc:
+            if exc.code != 503:
+                print("recombx: workbench is ready.", file=sys.stderr)
+                return True
+        except Exception:
+            pass
+        time.sleep(5)
+    return False
+
+
+def _multipart_request(
+    server: str,
+    fields: dict[str, str],
+    file_name: str,
+    file_bytes: bytes,
+    timeout: int,
+) -> dict[str, Any]:
+    boundary = "----recombx" + uuid.uuid4().hex
+    chunks: list[bytes] = []
+
+    for name, value in fields.items():
+        chunks.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n".encode("utf-8")
+        )
+
+    chunks.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="fasta_file"; filename="{file_name}"\r\n'
+            "Content-Type: text/plain\r\n\r\n"
+        ).encode("utf-8")
+    )
+    chunks.append(file_bytes)
+    chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+
+    url = server.rstrip("/") + "/api/infer"
+    request = urllib.request.Request(
+        url,
+        data=b"".join(chunks),
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+            "User-Agent": "recombx-cli/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise CLIError("Workbench returned a non-JSON response.") from exc
+
+
+def _run_inference(args: argparse.Namespace, fasta_name: str, fasta_bytes: bytes) -> dict[str, Any]:
+    fields = {
+        "checkpoint": args.checkpoint,
+        "scoring_mode": MODE_MAP[args.mode],
+        "null_policy": args.null_policy,
+        "flank_window": str(args.flank_window),
+        "min_seg": str(args.min_seg),
+        "beta": str(args.beta),
+        "z_thresh": str(args.z_thresh),
+        "tf_logit_thresh": str(args.tf_logit_thresh),
+        "merge_radius_bp": str(args.merge_radius_bp),
+        "eval_tolerance_bp": str(args.eval_tolerance_bp),
+        "use_mirror_tta": str(args.mirror_tta).lower(),
+    }
+
+    for attempt in range(2):
+        try:
+            return _multipart_request(
+                args.server, fields, fasta_name, fasta_bytes, args.timeout
+            )
+        except urllib.error.HTTPError as exc:
+            body = _http_error_body(exc)
+            if exc.code == 503 and attempt == 0 and "sleeping" in body.lower():
+                if _wake_if_needed(args.server, args.timeout):
+                    continue
+            raise CLIError(body) from exc
+        except urllib.error.URLError as exc:
+            raise CLIError(f"Could not reach {args.server}: {exc.reason}") from exc
+    raise CLIError("Workbench did not become ready after wake-up.")
+
+
+def _event_line(event: dict[str, Any]) -> str:
+    recombinants = []
+    parents = []
+    for rec in event.get("recombinants") or []:
+        name = str(rec.get("seq_name") or rec.get("seq_idx") or "?")
+        left = str(rec.get("ext_parent_left_name") or rec.get("parent_left_name") or "?")
+        right = str(rec.get("ext_parent_right_name") or rec.get("parent_right_name") or "?")
+        recombinants.append(name)
+        parents.append(f"{left}->{right}")
+    return "\t".join(
+        [
+            str(event.get("event_id") or ""),
+            str(event.get("most_plausible_bp_orig") or ""),
+            str(event.get("score_z") or ""),
+            str(event.get("tf_logit") or ""),
+            ";".join(recombinants),
+            ";".join(parents),
+            str(event.get("signal_attribution") or ""),
+        ]
+    )
+
+
+def _format_result(result: dict[str, Any], output_format: str) -> str:
+    events = result.get("consolidated_events") or []
+
+    if output_format == "json":
+        return json.dumps(result, indent=2, sort_keys=False)
+
+    if output_format == "tsv":
+        lines = ["event_id\tbp\tz_score\ttf_logit\trecombinants\tparents\tsignal"]
+        lines.extend(_event_line(event) for event in events)
+        return "\n".join(lines)
+
+    alignment = result.get("alignment") or {}
+    timings = result.get("timings") or {}
+    status = result.get("status") or "unknown"
+    dataset = alignment.get("dataset_name") or "alignment"
+    n_seq = alignment.get("n_sequences") or "?"
+    length = alignment.get("genome_length_bp") or "?"
+    summary = [
+        f"status: {status}",
+        f"dataset: {dataset}",
+        f"alignment: {n_seq} sequences x {length} bp",
+        f"events: {len(events)}",
+    ]
+    if timings.get("stage_summary_line"):
+        summary.append(f"timings: {timings['stage_summary_line']}")
+    for event in events:
+        summary.append(
+            f"  event {event.get('event_id')}: bp={event.get('most_plausible_bp_orig')} "
+            f"z={event.get('score_z')} {_event_line(event).split(chr(9))[4]}"
+        )
+    return "\n".join(summary)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="recombx",
+        description="Run GT-Transformer recombination detection from the command line.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    detect = subparsers.add_parser("detect", help="Detect recombination in an aligned FASTA file")
+    detect.add_argument("fasta", help="Aligned FASTA path, or '-' to read from stdin")
+    detect.add_argument("--server", default=DEFAULT_SERVER, help="Workbench base URL")
+    detect.add_argument(
+        "--mode",
+        default="hybrid",
+        choices=sorted(MODE_MAP),
+        help="Scoring mode (default: hybrid)",
+    )
+    detect.add_argument(
+        "--permutations",
+        type=int,
+        default=48,
+        help="Accepted for compatibility; the workbench uses its calibrated 48-permutation null",
+    )
+    detect.add_argument("--format", default="json", choices=["json", "tsv", "summary"])
+    detect.add_argument("--output", help="Write output to this file instead of stdout")
+    detect.add_argument("--checkpoint", default="ckpt_N40000")
+    detect.add_argument("--null-policy", default="duplicate", choices=["duplicate", "zero", "drop"])
+    detect.add_argument("--flank-window", type=int, default=250)
+    detect.add_argument("--min-seg", type=int, default=50)
+    detect.add_argument("--beta", type=float, default=20.0)
+    detect.add_argument("--z-thresh", type=float, default=6.0)
+    detect.add_argument("--tf-logit-thresh", type=float, default=0.8)
+    detect.add_argument("--merge-radius-bp", type=int, default=75)
+    detect.add_argument("--eval-tolerance-bp", type=int, default=30)
+    detect.add_argument("--mirror-tta", action="store_true")
+    detect.add_argument("--timeout", type=int, default=600, help="HTTP timeout in seconds")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.permutations != 48:
+        print(
+            "recombx: --permutations is accepted for compatibility; the live workbench "
+            "uses its calibrated 48-permutation null.",
+            file=sys.stderr,
+        )
+
+    if args.fasta == "-":
+        fasta_name = "stdin.fasta"
+        fasta_bytes = sys.stdin.buffer.read()
+    else:
+        path = Path(args.fasta)
+        if not path.is_file():
+            print(f"recombx: FASTA file not found: {path}", file=sys.stderr)
+            return 2
+        fasta_name = path.name
+        fasta_bytes = path.read_bytes()
+
+    if not fasta_bytes.strip():
+        print("recombx: FASTA file is empty.", file=sys.stderr)
+        return 2
+
+    try:
+        result = _run_inference(args, fasta_name, fasta_bytes)
+        rendered = _format_result(result, args.format)
+    except CLIError as exc:
+        print(f"recombx: {exc}", file=sys.stderr)
+        return 1
+
+    if args.output:
+        output_path = Path(args.output)
+        output_path.write_text(rendered + "\n", encoding="utf-8")
+        print(f"recombx: wrote {output_path}", file=sys.stderr)
+    else:
+        print(rendered)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

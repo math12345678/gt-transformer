@@ -11,7 +11,7 @@ const KEY_METRICS: MetricItem[] = [
   {
     value: '0.88 s',
     label: 'Sarbecovirus CPU Runtime',
-    context: '19-seq, 30.6 kb Sarbecovirus scan on CPU (Rust recombx)',
+    context: '19-seq, 30.6 kb Sarbecovirus scan on CPU (the recombx CLI)',
   },
   {
     value: '100% Specificity',
@@ -34,7 +34,7 @@ const BENCHMARK_ROWS = [
   {
     dataset: 'Sarbecovirus empirical alignment',
     dimensions: '19 seq × 30,600 bp',
-    engine: 'Rust recombx (hybrid)',
+    engine: 'the recombx CLI (hybrid)',
     outcome: '0.88 s wall-clock CPU',
     metric: 'Full-genome scan',
   },

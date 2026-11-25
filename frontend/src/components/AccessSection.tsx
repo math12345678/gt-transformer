@@ -4,45 +4,51 @@ import capsidImg from '../assets/images/sarbecovirus_capsid_1795626289236.jpg';
 import { useRevealOnScroll } from '../hooks/useRevealOnScroll';
 import { WORKBENCH_URL } from './Navbar';
 
+const RELEASE_BASE_URL =
+  'https://github.com/math12345678/gt-transformer/releases/download/v1.0.0-website';
+
+export const DMG_URL = `${RELEASE_BASE_URL}/GT-Transformer-macOS-arm64.dmg`;
+export const WINDOWS_URL = `${RELEASE_BASE_URL}/GT-Transformer-Windows-x86_64.exe`;
+export const CLI_ZIP_URL = `${RELEASE_BASE_URL}/recombx-cli.zip`;
+
 export const CLI_COMMAND =
-  'recombx detect --mode hybrid --permutations 48 --format json alignment.fasta';
+  './recombx detect --mode hybrid --permutations 48 --format json alignment.fasta';
 
 const COMPARISON_ROWS = [
   {
     dimension: 'Primary Use Case',
     web: 'Interactive exploration, visual triage & teaching',
     mac: 'Private pre-publication genomes on lab laptops',
-    cli: 'Batch surveillance, HPC clusters, Nextflow & Snakemake',
+    cli: 'Scripted scans and repeatable batch runs',
   },
   {
     dimension: 'Execution Engine',
     web: 'Browser UI backed by ckpt_N40000 hybrid stack',
-    mac: 'Bundled native engine (Apple Silicon & Intel)',
-    cli: 'Zero-dependency Rust binary with embedded ONNX',
+    mac: 'Apple Silicon desktop app with local engine',
+    cli: 'Python CLI client calling the same ckpt_N40000 workbench',
   },
   {
     dimension: 'Representative Runtime',
     web: 'Seconds per viral alignment (zero local install)',
     mac: 'Local CPU execution with no queue contention',
-    cli: '0.88 s on 19-seq, 30.6 kb Sarbecovirus (CPU)',
+    cli: 'Seconds per alignment, depending on live workbench load',
   },
   {
     dimension: 'Data Locality',
     web: 'Fast browser upload & interactive session',
     mac: '100% offline — FASTA never leaves your Mac',
-    cli: '100% local / air-gapped cluster execution',
+    cli: 'Runs locally; sends the FASTA to the live workbench',
   },
   {
     dimension: 'Visuals & Export Formats',
     web: '5 interactive plots, SimPlot, .rdp, GFF3, BED, FASTA',
     mac: 'Full local workbench UI + native .rdp & genomic exports',
-    cli: 'Deterministic JSON, TSV, GFF3, BED & native .rdp',
+    cli: 'Machine-readable JSON, TSV, and short summaries',
   },
 ];
 
 export const AccessSection: React.FC = () => {
   const [copied, setCopied] = useState(false);
-  const [dmgNoticeVisible, setDmgNoticeVisible] = useState(false);
   const { ref, isVisible } = useRevealOnScroll<HTMLElement>();
 
   const handleCopyCommand = async () => {
@@ -161,7 +167,7 @@ export const AccessSection: React.FC = () => {
                   Offline Native App
                 </p>
                 <span className="font-mono text-[11px] text-[#5A5A62] dark:text-[#2DD4A4]">
-                  Universal .dmg
+                  Apple Silicon .dmg
                 </span>
               </div>
 
@@ -171,92 +177,101 @@ export const AccessSection: React.FC = () => {
 
               <p className="mt-3 text-[14.5px] leading-[1.6] text-[#5A5A62] dark:text-[#A8ADB8]">
                 Standalone native{' '}
-                <code className="text-[12.5px] text-[#141416] dark:text-[#2DD4A4]">.dmg</code> app bundling the local inference engine for offline, private genomic analysis.
+                <code className="text-[12.5px] text-[#141416] dark:text-[#2DD4A4]">.dmg</code> app for Apple Silicon Macs, with the local inference engine bundled in.
               </p>
 
               <ul className="mt-5 space-y-2 text-[13px] text-[#5A5A62] dark:text-[#A8ADB8]">
                 <li className="flex items-baseline gap-2">
                   <span className="font-mono text-[#1B9E77] dark:text-[#2DD4A4]">—</span>
-                  <span>Pre-publication viral genomes stay strictly on your workstation</span>
+                  <span>Pre-publication viral genomes stay on your workstation</span>
                 </li>
                 <li className="flex items-baseline gap-2">
                   <span className="font-mono text-[#1B9E77] dark:text-[#2DD4A4]">—</span>
-                  <span>Bundled checkpoints for Apple Silicon &amp; Intel Macs</span>
+                  <span>Apple Silicon build, ready to open after download</span>
                 </li>
               </ul>
             </div>
 
-            <div className="mt-7 pt-5 border-t border-[#ECEBE6] dark:border-[#2B2E36]">
+            <div className="mt-7 pt-5 border-t border-[#ECEBE6] dark:border-[#2B2E36] space-y-3">
               <a
-                href="#download-dmg"
-                onClick={() => setDmgNoticeVisible(true)}
+                href={DMG_URL}
+                download="GT-Transformer-macOS-arm64.dmg"
                 className="inline-flex w-full items-center justify-center gap-2 px-5 py-2.5 text-[13.5px] font-medium text-[#141416] dark:text-[#F3F4F6] bg-[#F6F6F3] dark:bg-[#121316] border border-[#DEDDD7] dark:border-[#323640] hover:border-[#141416] dark:hover:border-[#2DD4A4] hover:bg-white dark:hover:bg-[#1E2128] rounded-xl transition-colors duration-150 whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4F6BF6]"
               >
                 <Download className="w-4 h-4 shrink-0 text-[#5A5A62] dark:text-[#2DD4A4]" aria-hidden="true" />
                 <span>Download for macOS (.dmg)</span>
               </a>
-
-              {dmgNoticeVisible && (
-                <p
-                  role="status"
-                  className="panel-settle mt-3 text-[12px] leading-relaxed text-[#5A5A62] dark:text-[#A8ADB8] font-mono bg-[#FAF9F7] dark:bg-[#121316] border border-[#E6E5DF] dark:border-[#2B2E36] rounded-lg px-3 py-2"
-                >
-                  macOS universal .dmg installer is packaged per release. Use the live Web Workbench or Rust CLI for immediate inference.
-                </p>
-              )}
+              <a
+                href={WINDOWS_URL}
+                download="GT-Transformer-Windows-x86_64.exe"
+                className="inline-flex w-full items-center justify-center gap-2 px-5 py-2.5 text-[13.5px] font-medium text-[#5A5A62] dark:text-[#A8ADB8] bg-transparent border border-[#E6E5DF] dark:border-[#323640] hover:border-[#141416] dark:hover:border-[#2DD4A4] hover:text-[#141416] dark:hover:text-[#F3F4F6] rounded-xl transition-colors duration-150 whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4F6BF6]"
+              >
+                <Download className="w-4 h-4 shrink-0" aria-hidden="true" />
+                <span>Download for Windows (.exe)</span>
+              </a>
             </div>
           </article>
 
-          {/* Panel 3 (Full-Width Dark Architectural Console): Rust CLI (recombx) */}
+          {/* Panel 3 (Full-Width Dark Architectural Console): recombx CLI */}
           <article className="lg:col-span-12 bg-[#141416] dark:bg-[#1A1D24] border border-transparent dark:border-[#323640] text-white rounded-2xl p-7 sm:p-8 grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 items-center">
             <div className="lg:col-span-5">
               <div className="flex items-center gap-3">
                 <p className="font-mono text-[11px] uppercase tracking-[0.12em] text-[#34D399]">
-                  Rust CLI · recombx
+                  Command line · recombx
                 </p>
-                <span className="font-mono text-[11px] text-[#A1A1AA]">· ONNX embedded</span>
+                <span className="font-mono text-[11px] text-[#A1A1AA]">· Python, no packages needed</span>
               </div>
               <h3 className="mt-2 text-[22px] font-semibold tracking-tight text-white">
-                Rust CLI (recombx)
+                Command Line (recombx)
               </h3>
               <p className="mt-2.5 text-[14px] leading-[1.6] text-[#C4C4CC]">
-                Zero-dependency compiled binary with embedded ONNX weights for reproducible HPC, Nextflow, and Snakemake workflows.
+                A small command-line client for scripted runs. It uses the same ckpt_N40000 hybrid workbench as the browser app and wakes the live service automatically if needed.
               </p>
             </div>
 
             <div className="lg:col-span-7">
               <div className="rounded-xl border border-white/15 bg-[#0F1115] overflow-hidden">
-                <div className="px-4 py-2.5 border-b border-white/10 flex items-center justify-between gap-3">
+                <div className="px-4 py-2.5 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
                   <span className="inline-flex items-center gap-2 font-mono text-[11px] text-[#A1A1AA]">
                     <Terminal className="w-3.5 h-3.5 text-[#34D399]" aria-hidden="true" />
-                    <span>Hybrid CPU inference</span>
+                    <span>Hybrid inference from your terminal</span>
                   </span>
-                  <button
-                    type="button"
-                    onClick={handleCopyCommand}
-                    aria-label="Copy recombx CLI command"
-                    className="inline-flex items-center gap-1.5 px-3 py-1 text-[11.5px] font-mono text-white bg-white/10 hover:bg-white/15 border border-white/15 rounded-md transition-colors duration-150 whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4F6BF6]"
-                  >
-                    {copied ? (
-                      <>
-                        <Check className="w-3.5 h-3.5 text-[#34D399]" aria-hidden="true" />
-                        <span className="text-[#34D399]">Copied</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3.5 h-3.5 text-[#C4C4CC]" aria-hidden="true" />
-                        <span>Copy</span>
-                      </>
-                    )}
-                  </button>
+                  <div className="inline-flex items-center gap-2">
+                    <a
+                      href={CLI_ZIP_URL}
+                      download="recombx-cli.zip"
+                      className="inline-flex items-center gap-1.5 px-3 py-1 text-[11.5px] font-mono text-white bg-[#34D399]/15 hover:bg-[#34D399]/25 border border-[#34D399]/35 rounded-md transition-colors duration-150 whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4F6BF6]"
+                    >
+                      <Download className="w-3.5 h-3.5 text-[#34D399]" aria-hidden="true" />
+                      <span>Download CLI (.zip)</span>
+                    </a>
+                    <button
+                      type="button"
+                      onClick={handleCopyCommand}
+                      aria-label="Copy recombx CLI command"
+                      className="inline-flex items-center gap-1.5 px-3 py-1 text-[11.5px] font-mono text-white bg-white/10 hover:bg-white/15 border border-white/15 rounded-md transition-colors duration-150 whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#4F6BF6]"
+                    >
+                      {copied ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-[#34D399]" aria-hidden="true" />
+                          <span className="text-[#34D399]">Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5 text-[#C4C4CC]" aria-hidden="true" />
+                          <span>Copy</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
                 <pre className="p-4 text-[12.5px] sm:text-[13px] leading-[1.65] font-mono text-[#F4F4F6] whitespace-pre-wrap break-words">
                   <code>{CLI_COMMAND}</code>
                 </pre>
               </div>
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11.5px] font-mono text-[#A1A1AA]">
-                <span>Outputs: JSON · TSV · GFF3 · .rdp</span>
-                <span className="text-[#34D399]">0.88 s on 19-seq, 30.6 kb Sarbecovirus CPU scan</span>
+                <span>Unzip the download, then run the command inside that folder.</span>
+                <span className="text-[#34D399]">Outputs: JSON · TSV · summary</span>
               </div>
             </div>
           </article>
@@ -269,7 +284,7 @@ export const AccessSection: React.FC = () => {
               Choose the right Ground Truth surface
             </h3>
             <span className="font-mono text-[11.5px] text-[#5A5A62] dark:text-[#A8ADB8]">
-              Web Workbench · macOS App · Rust CLI (recombx)
+              Web Workbench · macOS App · recombx CLI
             </span>
           </div>
 
@@ -286,7 +301,7 @@ export const AccessSection: React.FC = () => {
                       macOS Desktop App
                     </th>
                     <th className="py-3.5 px-5 font-semibold text-[#1B9E77] dark:text-[#2DD4A4]">
-                      Rust CLI (recombx)
+                      recombx CLI
                     </th>
                   </tr>
                 </thead>
