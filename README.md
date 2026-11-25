@@ -18,7 +18,7 @@ All launch links in the landing UI point directly to the live workbench, while p
 
 ```bash
 cd frontend
-npm ci
+npm install
 npm run dev          # Starts Vite dev server at http://localhost:3000
 ```
 
