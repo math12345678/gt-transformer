@@ -208,7 +208,7 @@ class TestPhases1To6(unittest.TestCase):
 
         self.assertTrue((WEB_DIR / "Dockerfile").is_file())
         self.assertTrue((WEB_DIR / "README.md").is_file())
-        self.assertTrue((WEB_DIR / "index.html").is_file())
+        self.assertTrue((WEB_DIR / "frontend" / "index.html").is_file())
 
 
 if __name__ == "__main__":
