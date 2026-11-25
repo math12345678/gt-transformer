@@ -4,14 +4,39 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>gt-transformer | Recombination Detection Interface</title>
-  <link rel="stylesheet" href="/static/css/styles.css?v=15" />
+  <title>Ground Truth — GT-Transformer Recombination Workbench</title>
+  <link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg" />
+  <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/static/css/styles.css?v=16" />
 </head>
 
 <body>
   <!-- Desktop Toolbar -->
   <header class="rdp-toolbar app-toolbar">
     <div class="toolbar-buttons">
+      <a
+        class="gt-brand-link"
+        href="https://math12345678.github.io/gt-transformer/"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Ground Truth — Project Overview &amp; Landing Page"
+      >
+        <svg width="32" height="16" viewBox="0 0 72 36" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path d="M 6 29.5 H 20.5 C 25.8 29.5 29.2 26.2 32.3 22.4" stroke="#1B9E77" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M 39.7 13.6 C 42.8 9.8 46.2 6.5 51.5 6.5 H 66" stroke="#1B9E77" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M 50.5 11.8 H 66 M 58.2 11.8 V 24.8" stroke="#1B9E77" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M 6 6.5 H 20.5 C 27.5 6.5 31.5 12.2 36 18 C 40.5 23.8 44.5 29.5 51.5 29.5 H 66" stroke="#141416" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M 19.6 13.5 A 6.8 6.8 0 1 0 21.3 18 H 15.2" stroke="#141416" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="gt-brand-wordmark">GROUND TRUTH</span>
+      </a>
+      <div class="tb-sep"></div>
       <button type="button" id="btnOpenFasta" class="tb-btn" title="Upload or paste FASTA alignment & ground truth">
         Open
       </button>
@@ -59,7 +84,7 @@
 
     <div class="toolbar-dataset">
       <select id="presetSelect" class="tb-select hidden" aria-hidden="true" tabindex="-1"></select>
-      <span id="activeAlignmentBadge" class="status-box" style="background:#f8fafc;border-color:#94a3b8;color:#0f172a;"
+      <span id="activeAlignmentBadge" class="status-box" style="background:#FAF9F7;border-color:#D0CFC7;color:#141416;"
         title="Active FASTA alignment (click Open or drop a .fasta/.fas/.fa file anywhere)">No alignment loaded (Click Open or Drop FASTA)</span>
       <span id="engineStatusBadge" class="status-box">live · 570,881 params · ready</span>
       <button type="button" id="btnCompareRuns" class="tb-btn" title="Compare recent or saved runs side by side">Compare</button>

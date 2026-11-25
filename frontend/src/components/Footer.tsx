@@ -57,6 +57,14 @@ export const Footer: React.FC = () => {
               CLI &amp; Desktop
             </a>
             <a
+              href="https://github.com/math12345678/gt-transformer"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[#5A5A62] dark:text-[#A8ADB8] hover:text-[#141416] dark:hover:text-[#F3F4F6] transition-colors"
+            >
+              GitHub
+            </a>
+            <a
               href={WORKBENCH_URL}
               target="_blank"
               rel="noopener noreferrer"

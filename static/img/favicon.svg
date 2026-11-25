@@ -1,0 +1,16 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="64" height="64" rx="14" fill="#141416"/>
+  <g transform="translate(5 14)">
+    <svg width="54" height="36" viewBox="0 0 72 36" fill="none">
+      <!-- Complementary ascending strand (underneath with clean negative-space break) -->
+      <path d="M 6 29.5 H 20.5 C 25.8 29.5 29.2 26.2 32.3 22.4" stroke="#2DD4A4" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M 39.7 13.6 C 42.8 9.8 46.2 6.5 51.5 6.5 H 66" stroke="#2DD4A4" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <!-- Geometric monoline T -->
+      <path d="M 50.5 11.8 H 66 M 58.2 11.8 V 24.8" stroke="#2DD4A4" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <!-- Primary descending strand -->
+      <path d="M 6 6.5 H 20.5 C 27.5 6.5 31.5 12.2 36 18 C 40.5 23.8 44.5 29.5 51.5 29.5 H 66" stroke="#FFFFFF" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <!-- Geometric monoline G -->
+      <path d="M 19.6 13.5 A 6.8 6.8 0 1 0 21.3 18 H 15.2" stroke="#FFFFFF" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  </g>
+</svg>
